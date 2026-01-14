@@ -136,12 +136,13 @@ def main(args):
     with open(stats_path, "wb") as f:
         pickle.dump(stats, f)
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    best_step, min_val_loss, best_state_dict = best_ckpt_info
 
     # save best checkpoint
     ckpt_path = os.path.join(ckpt_dir, f"policy_best.ckpt")
     torch.save(best_state_dict, ckpt_path)
-    print(f"Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}")
+    step_name = "update" if config.get("target_updates") is not None else "epoch"
+    print(f"Best ckpt, val loss {min_val_loss:.6f} @ {step_name}{best_step}")
 
 
 def make_policy(policy_class, policy_config):
@@ -444,9 +445,9 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     steps_per_epoch = max(1, len(train_dataloader))
     needed_epochs = math.ceil(target_updates / steps_per_epoch)
-    if num_epochs < needed_epochs:
+    if num_epochs != needed_epochs:
         print(
-            f"[budget] Override num_epochs {num_epochs} -> {needed_epochs} "
+            f"[budget] Set num_epochs {num_epochs} -> {needed_epochs} "
             f"(target_updates={target_updates}, steps_per_epoch={steps_per_epoch})"
         )
         num_epochs = needed_epochs
@@ -458,7 +459,7 @@ def train_bc(train_dataloader, val_dataloader, config):
         eval_every_updates = int(eval_every_updates)
 
     if not save_every_updates or int(save_every_updates) <= 0:
-        save_every_updates = max(1000, eval_every_updates)
+        save_every_updates = max(5000, eval_every_updates)
     else:
         save_every_updates = int(save_every_updates)
 
