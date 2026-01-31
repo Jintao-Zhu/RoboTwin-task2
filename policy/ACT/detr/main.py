@@ -120,6 +120,12 @@ def get_args_parser():
     parser.add_argument("--eval_every_updates", action="store", type=int, required=False, default=0)
     parser.add_argument("--save_every_updates", action="store", type=int, required=False, default=0)
     parser.add_argument("--log_every_updates", action="store", type=int, required=False, default=0)
+    # sampling plan / anchor args (not used by DETR; kept to avoid argparse errors)
+    parser.add_argument("--sampling_plan_path", action="store", type=str, required=False, default=None)
+    parser.add_argument("--plan_num_samples", action="store", type=int, required=False, default=0)
+    parser.add_argument("--plan_sampler_seed", action="store", type=int, required=False, default=0)
+    parser.add_argument("--plan_no_replacement", action="store_true")
+    parser.add_argument("--plan_no_verify_sha256", action="store_true")
     # parser.add_argument('--num_queries',type=int, required=True)
     # parser.add_argument('--actionsByQuery',type=int, required=True)
 

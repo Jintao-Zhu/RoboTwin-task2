@@ -75,11 +75,14 @@ done
 cd "${act_dir}"
 
 dataset_dir="${act_dir}/processed_data/sim-${task_name}/${task_config}-${expert_data_num}"
-if [[ ! -d "${dataset_dir}" ]]; then
-  echo "未找到处理后的数据目录：${dataset_dir}"
-  echo "提示：请先处理数据（示例）："
-  echo "  (cd ${act_dir} && bash process_data.sh ${task_name} ${task_config} ${expert_data_num})"
-  exit 1
+# 只在需要训练时检查数据目录
+if [[ "${skip_train}" != "1" ]]; then
+  if [[ ! -d "${dataset_dir}" ]]; then
+    echo "未找到处理后的数据目录：${dataset_dir}"
+    echo "提示：请先处理数据（示例）："
+    echo "  (cd ${act_dir} && bash process_data.sh ${task_name} ${task_config} ${expert_data_num})"
+    exit 1
+  fi
 fi
 
 base_ckpt_setting="${task_config}-u${max_updates}"
@@ -119,8 +122,40 @@ if [[ "${skip_train}" != "1" ]]; then
   end_ts="$(date +%s)"
   train_seconds="$(( end_ts - start_ts ))"
 else
-  echo "[sweep] SKIP_TRAIN=1：跳过训练，只做“链接+评测”。"
+  echo "[sweep] SKIP_TRAIN=1：跳过训练，只做"链接+评测"。"
+  # 查找已存在的训练目录（包含所需checkpoint的目录）
+  # 优先查找能覆盖所有budgets的最小训练目录
+  found_base_dir=""
+  for existing_dir in "${act_dir}"/act_ckpt/act-"${task_name}"/"${task_config}"-u*-"${expert_data_num}"; do
+    if [[ -d "${existing_dir}" ]] && [[ -f "${existing_dir}/dataset_stats.pkl" ]]; then
+      # 提取这个目录对应的updates数
+      dir_updates=$(basename "${existing_dir}" | sed -n "s/${task_config}-u\([0-9]\+\)-${expert_data_num}/\1/p")
+      if [[ -n "${dir_updates}" ]] && (( dir_updates >= max_updates )); then
+        # 检查是否包含所有需要的checkpoint
+        all_checkpoints_exist=1
+        for b in "${budgets[@]}"; do
+          ckpt_file="${existing_dir}/policy_update_${b}_seed_${seed}.ckpt"
+          if [[ ! -f "${ckpt_file}" ]]; then
+            all_checkpoints_exist=0
+            break
+          fi
+        done
+        if (( all_checkpoints_exist == 1 )); then
+          if [[ -z "${found_base_dir}" ]] || (( dir_updates < $(basename "${found_base_dir}" | sed -n "s/${task_config}-u\([0-9]\+\)-${expert_data_num}/\1/p") )); then
+            found_base_dir="${existing_dir}"
+          fi
+        fi
+      fi
+    fi
+  done
+  
+  if [[ -n "${found_base_dir}" ]]; then
+    base_ckpt_dir="${found_base_dir}"
+    echo "[sweep] 使用已存在的训练目录：${base_ckpt_dir}"
+  fi
+  
   # 尝试复用 base 目录下最近一次训练日志（如果没有，就留空）
+  base_log_dir="$(dirname "${base_ckpt_dir}" | sed "s|act_ckpt/act-|logs/|")/$(basename "${base_ckpt_dir}")"
   existing_train_log="$(ls -1t "${base_log_dir}"/train_*.log 2>/dev/null | head -n 1 || true)"
   if [[ -n "${existing_train_log}" ]]; then
     train_log="${existing_train_log}"
@@ -131,6 +166,10 @@ fi
 
 if [[ ! -d "${base_ckpt_dir}" ]]; then
   echo "未找到 base ckpt 目录：${base_ckpt_dir}"
+  echo "提示：需要一个包含以下所有checkpoint的训练目录："
+  for b in "${budgets[@]}"; do
+    echo "  - policy_update_${b}_seed_${seed}.ckpt"
+  done
   exit 1
 fi
 

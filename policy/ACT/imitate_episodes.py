@@ -126,8 +126,19 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
-                                                           batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir,
+        num_episodes,
+        camera_names,
+        batch_size_train,
+        batch_size_val,
+        # === sampling plan / anchor（默认关闭，不影响 baseline）===
+        sampling_plan_path=args.get("sampling_plan_path"),
+        plan_num_samples=int(args.get("plan_num_samples") or 0),
+        plan_sampler_seed=int(args.get("plan_sampler_seed") or 0),
+        plan_no_replacement=bool(args.get("plan_no_replacement")),
+        plan_verify_sha256=(not bool(args.get("plan_no_verify_sha256"))),
+    )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -649,6 +660,42 @@ if __name__ == "__main__":
         required=False,
         default=0,
         help="Optional: print train loss every N updates when using --target_updates (0=auto).",
+    )
+
+    # === sampling plan / anchor（默认关闭，不影响 baseline）===
+    parser.add_argument(
+        "--sampling_plan_path",
+        action="store",
+        type=str,
+        required=False,
+        default=None,
+        help="可选：Sampling Plan 路径（目录 / plan_meta.json / plan_arrays.npz）。设置后训练将使用 anchors + WeightedRandomSampler 采样。",
+    )
+    parser.add_argument(
+        "--plan_num_samples",
+        action="store",
+        type=int,
+        required=False,
+        default=0,
+        help="可选：启用 plan 时，每个 epoch 采样多少个 anchor（<=0 表示默认=训练集 episode 数量，尽量对齐 baseline 的 steps/epoch）。",
+    )
+    parser.add_argument(
+        "--plan_sampler_seed",
+        action="store",
+        type=int,
+        required=False,
+        default=0,
+        help="可选：WeightedRandomSampler 的随机种子（保证可复现）。",
+    )
+    parser.add_argument(
+        "--plan_no_replacement",
+        action="store_true",
+        help="可选：关闭“有放回采样”（默认：有放回采样=True）。",
+    )
+    parser.add_argument(
+        "--plan_no_verify_sha256",
+        action="store_true",
+        help="可选：关闭 sampling plan 的 sha256 校验（不推荐）。",
     )
 
     # for ACT

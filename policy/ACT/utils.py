@@ -2,41 +2,79 @@ import numpy as np
 import torch
 import os
 import h5py
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
 
 import IPython
 
 e = IPython.embed
 
+try:
+    # sampling_plan.py 在同一目录下；训练通常从 policy/ACT 目录启动，因此可直接 import
+    from sampling_plan import SamplingPlan
+except Exception:
+    # 兼容：如果以 package 方式导入（policy.ACT.utils），则使用相对导入
+    from .sampling_plan import SamplingPlan
 
 class EpisodicDataset(torch.utils.data.Dataset):
 
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len, anchors=None):
+        """EpisodicDataset（episode 采样 / anchor 采样 两用版）。
+
+        baseline（默认）：
+        - DataLoader 按 episode_ids 做 shuffle
+        - 每次 __getitem__ 内部随机选 start_ts（起点）
+
+        anchor 模式（启用 sampling plan 时）：
+        - anchors 里包含每个样本的 (episode_id, start_ts)
+        - __getitem__ 不再随机 start_ts，而是按 anchors[index] 确定性取片段
+
+        这样可以在不改模型的前提下，把“训练看到什么数据”固化成可审计的计划（plan），
+        为后续课程学习/去冗余/优先采样提供统一入口。
+        """
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.max_action_len = max_action_len
+        # anchors: dict-like，至少包含 episode_ids/start_ts 两个 1D 数组
+        self.anchors = anchors
         self.is_sim = None
+        if self.anchors is not None:
+            if len(self.anchors["episode_ids"]) == 0:
+                raise ValueError("anchors is empty; cannot build anchored dataset.")
         self.__getitem__(0)  # initialize self.is_sim
 
     def __len__(self):
+        if self.anchors is not None:
+            return int(len(self.anchors["episode_ids"]))
         return len(self.episode_ids)
 
     def __getitem__(self, index):
         sample_full_episode = False
 
-        episode_id = self.episode_ids[index]
+        # === (1) 确定 episode_id 与 start_ts（起点） ===
+        # baseline：episode_id 由 DataLoader 的 shuffle 决定；start_ts 在这里随机
+        # plan：episode_id/start_ts 都由 anchors[index] 决定（可复现、可加权）
+        if self.anchors is not None:
+            episode_id = int(self.anchors["episode_ids"][index])
+            start_ts = int(self.anchors["start_ts"][index])
+        else:
+            episode_id = self.episode_ids[index]
         dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(dataset_path, "r") as root:
             is_sim = None
             original_action_shape = root["/action"].shape
             episode_len = original_action_shape[0]
-            if sample_full_episode:
-                start_ts = 0
+            if self.anchors is None:
+                # 只有 baseline 模式才随机 start_ts
+                if sample_full_episode:
+                    start_ts = 0
+                else:
+                    start_ts = np.random.choice(episode_len)
             else:
-                start_ts = np.random.choice(episode_len)
+                # anchor 模式下做一个安全裁剪：避免 start_ts 越界
+                start_ts = int(np.clip(int(start_ts), 0, max(0, episode_len - 1)))
             # get observation at start_ts only
             qpos = root["/observations/qpos"][start_ts]
             image_dict = dict()
@@ -136,7 +174,19 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats, max_action_len
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val):
+def load_data(
+    dataset_dir,
+    num_episodes,
+    camera_names,
+    batch_size_train,
+    batch_size_val,
+    *,
+    sampling_plan_path: str | None = None,
+    plan_num_samples: int = 0,
+    plan_sampler_seed: int = 0,
+    plan_no_replacement: bool = False,
+    plan_verify_sha256: bool = True,
+):
     print(f"\nData from: {dataset_dir}\n")
     # obtain train test split
     train_ratio = 0.8
@@ -148,23 +198,70 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     norm_stats, max_action_len = get_norm_stats(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len)
+    # === train dataloader ===
+    # 默认（sampling_plan_path=None）：保持原始逻辑不变
+    train_sampler = None
+    anchors = None
+    if sampling_plan_path:
+        # 读取 plan 并过滤到 train episodes
+        plan = SamplingPlan.load(sampling_plan_path, verify_sha256=bool(plan_verify_sha256))
+        keep = np.isin(plan.episode_ids, train_indices)
+        if not np.any(keep):
+            raise ValueError(
+                f"Sampling plan has zero anchors after filtering to train split. "
+                f"plan={sampling_plan_path}, train_episodes={len(train_indices)}"
+            )
+
+        anchors = {
+            "episode_ids": plan.episode_ids[keep].astype(np.int64, copy=False),
+            "start_ts": plan.start_ts[keep].astype(np.int64, copy=False),
+            "stage_ids": plan.stage_ids[keep].astype(np.int32, copy=False),
+            "weights": plan.weights[keep].astype(np.float32, copy=False),
+        }
+
+        # plan_num_samples（每个 epoch 采样多少个 anchor）
+        # - baseline 里每个 epoch 大约“每条 episode 采 1 个片段”，所以这里默认对齐 train_episode 数量
+        num_samples = int(plan_num_samples) if int(plan_num_samples) > 0 else int(len(train_indices))
+        replacement = not bool(plan_no_replacement)
+        g = torch.Generator()
+        g.manual_seed(int(plan_sampler_seed))
+
+        train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(anchors["weights"], dtype=torch.double),
+            num_samples=num_samples,
+            replacement=replacement,
+            generator=g,
+        )
+        print(
+            f"[sampling_plan] 已启用：anchors={len(anchors['episode_ids'])}, "
+            f"每个epoch采样数={num_samples}, 有放回采样={replacement}, sampler_seed={int(plan_sampler_seed)}"
+        )
+
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len, anchors=anchors)
     val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, max_action_len)
+
+    # DataLoader 的 worker 设置（默认保持原值：num_workers=1, prefetch_factor=1）。
+    # 但在某些系统（例如受限容器）里，多进程可能会触发权限/共享内存问题；
+    # 此时你可以在命令行前加环境变量来降级到单进程加载：
+    #   ACT_NUM_WORKERS=0 bash ...
+    num_workers = int(os.environ.get("ACT_NUM_WORKERS", "1"))
+    prefetch_factor = int(os.environ.get("ACT_PREFETCH_FACTOR", "1"))
+    common_loader_kwargs = {"pin_memory": True, "num_workers": num_workers}
+    if num_workers > 0:
+        common_loader_kwargs["prefetch_factor"] = prefetch_factor
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        **common_loader_kwargs,
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size_val,
         shuffle=True,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
+        **common_loader_kwargs,
     )
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim

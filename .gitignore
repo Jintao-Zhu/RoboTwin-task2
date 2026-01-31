@@ -35,3 +35,5 @@ policy/pi0/training_data/*
 replay_videos/*
 policy/DP_mn/*
 policy/pi0/sampling_plans/*
+policy/ACT/sampling_plans
+policy/ACT/docs/*
