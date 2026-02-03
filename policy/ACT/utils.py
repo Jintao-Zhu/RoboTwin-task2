@@ -332,3 +332,121 @@ def detach_dict(d):
 def set_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def load_data_with_rlas_support(
+    dataset_dir,
+    num_episodes,
+    camera_names,
+    batch_size_train,
+    batch_size_val,
+    *,
+    sampling_plan_path: str | None = None,
+    plan_num_samples: int = 0,
+    plan_sampler_seed: int = 0,
+    plan_no_replacement: bool = False,
+    plan_verify_sha256: bool = True,
+    enable_rlas: bool = False,
+):
+    """
+    加载数据并支持 RLAS 动态采样
+    
+    与 load_data 的区别：
+    1. 当 enable_rlas=True 时，返回 DynamicWeightedSampler 而非 WeightedRandomSampler
+    2. 返回 train_dataset 引用，便于 RLAS 计算 anchor losses
+    
+    返回：
+        train_dataloader, val_dataloader, norm_stats, is_sim, train_dataset, sampler
+        - sampler: 当 enable_rlas=True 时为 DynamicWeightedSampler，否则为 None
+    """
+    print(f"\nData from: {dataset_dir}\n")
+    # obtain train test split
+    train_ratio = 0.8
+    shuffled_indices = np.random.permutation(num_episodes)
+    train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
+    val_indices = shuffled_indices[int(train_ratio * num_episodes):]
+
+    # obtain normalization stats for qpos and action
+    norm_stats, max_action_len = get_norm_stats(dataset_dir, num_episodes)
+
+    # construct dataset and dataloader
+    train_sampler = None
+    dynamic_sampler = None
+    anchors = None
+    
+    if sampling_plan_path:
+        # 读取 plan 并过滤到 train episodes
+        plan = SamplingPlan.load(sampling_plan_path, verify_sha256=bool(plan_verify_sha256))
+        keep = np.isin(plan.episode_ids, train_indices)
+        if not np.any(keep):
+            raise ValueError(
+                f"Sampling plan has zero anchors after filtering to train split. "
+                f"plan={sampling_plan_path}, train_episodes={len(train_indices)}"
+            )
+
+        anchors = {
+            "episode_ids": plan.episode_ids[keep].astype(np.int64, copy=False),
+            "start_ts": plan.start_ts[keep].astype(np.int64, copy=False),
+            "stage_ids": plan.stage_ids[keep].astype(np.int32, copy=False),
+            "weights": plan.weights[keep].astype(np.float32, copy=False),
+        }
+
+        num_samples = int(plan_num_samples) if int(plan_num_samples) > 0 else int(len(train_indices))
+        replacement = not bool(plan_no_replacement)
+
+        if enable_rlas:
+            # 使用 RLAS 的 DynamicWeightedSampler
+            from rlas import DynamicWeightedSampler
+            
+            dynamic_sampler = DynamicWeightedSampler(
+                num_anchors=len(anchors["episode_ids"]),
+                num_samples=num_samples,
+                initial_weights=anchors["weights"],
+                replacement=replacement,
+                seed=int(plan_sampler_seed),
+            )
+            train_sampler = dynamic_sampler
+            print(
+                f"[RLAS] DynamicWeightedSampler 已创建：anchors={len(anchors['episode_ids'])}, "
+                f"每个epoch采样数={num_samples}, 有放回采样={replacement}"
+            )
+        else:
+            # 使用静态 WeightedRandomSampler
+            g = torch.Generator()
+            g.manual_seed(int(plan_sampler_seed))
+
+            train_sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(anchors["weights"], dtype=torch.double),
+                num_samples=num_samples,
+                replacement=replacement,
+                generator=g,
+            )
+            print(
+                f"[sampling_plan] 已启用：anchors={len(anchors['episode_ids'])}, "
+                f"每个epoch采样数={num_samples}, 有放回采样={replacement}"
+            )
+
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len, anchors=anchors)
+    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, max_action_len)
+
+    num_workers = int(os.environ.get("ACT_NUM_WORKERS", "1"))
+    prefetch_factor = int(os.environ.get("ACT_PREFETCH_FACTOR", "1"))
+    common_loader_kwargs = {"pin_memory": True, "num_workers": num_workers}
+    if num_workers > 0:
+        common_loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=batch_size_train,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        **common_loader_kwargs,
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size_val,
+        shuffle=True,
+        **common_loader_kwargs,
+    )
+
+    return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim, train_dataset, dynamic_sampler
