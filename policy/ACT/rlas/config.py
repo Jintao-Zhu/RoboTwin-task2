@@ -29,6 +29,8 @@ class RLASConfig:
         - ema_beta 越大，baseline 更新越慢
     - alpha: 权重幂次参数（可选，用于调整权重的锐度）
     - scoring_batch_size: 计算 anchor loss 时的 batch size（越大越快，但需要更多显存）
+    - scoring_num_workers: DataLoader 工作进程数（用于并行加载数据）
+    - scoring_prefetch_factor: 每个 worker 预取的 batch 数
     """
     
     enable: bool = False
@@ -38,7 +40,9 @@ class RLASConfig:
     epsilon_mix: float = 0.1
     ema_beta: float = 0.5
     alpha: float = 1.0
-    scoring_batch_size: int = 64
+    scoring_batch_size: int = 64  # 默认 batch size（保持显存占用不变）
+    scoring_num_workers: int = 4  # 启用多进程数据加载（加速 I/O）
+    scoring_prefetch_factor: int = 2  # 预取因子（加速数据传输）
     
     # 可选：保存权重快照便于分析
     save_weight_snapshots: bool = True
@@ -52,6 +56,8 @@ class RLASConfig:
         assert 0 <= self.ema_beta <= 1, f"ema_beta 必须在 [0, 1] 范围内, 当前值: {self.ema_beta}"
         assert self.alpha > 0, f"alpha 必须 > 0, 当前值: {self.alpha}"
         assert self.scoring_batch_size > 0, f"scoring_batch_size 必须 > 0, 当前值: {self.scoring_batch_size}"
+        assert self.scoring_num_workers >= 0, f"scoring_num_workers 必须 >= 0, 当前值: {self.scoring_num_workers}"
+        assert self.scoring_prefetch_factor > 0, f"scoring_prefetch_factor 必须 > 0, 当前值: {self.scoring_prefetch_factor}"
 
     @classmethod
     def from_args(cls, args: dict) -> "RLASConfig":
@@ -73,6 +79,8 @@ class RLASConfig:
             ema_beta=float(args.get("rlas_ema_beta", 0.5)),
             alpha=float(args.get("rlas_alpha", 1.0)),
             scoring_batch_size=int(args.get("rlas_scoring_batch_size", 64)),
+            scoring_num_workers=int(args.get("rlas_scoring_num_workers", 4)),
+            scoring_prefetch_factor=int(args.get("rlas_scoring_prefetch_factor", 2)),
             save_weight_snapshots=bool(args.get("rlas_save_snapshots", True)),
         )
 
@@ -87,5 +95,7 @@ class RLASConfig:
             "ema_beta": self.ema_beta,
             "alpha": self.alpha,
             "scoring_batch_size": self.scoring_batch_size,
+            "scoring_num_workers": self.scoring_num_workers,
+            "scoring_prefetch_factor": self.scoring_prefetch_factor,
             "save_weight_snapshots": self.save_weight_snapshots,
         }

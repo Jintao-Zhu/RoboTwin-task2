@@ -7,8 +7,14 @@ Anchor Loss 计算模块
 
 设计要点：
 1. 使用 torch.no_grad() 避免不必要的梯度计算
-2. 可配置 batch_size 以平衡速度和显存
-3. 只计算 action loss（L1），不包括 KL loss
+2. 使用多进程数据加载加速磁盘 I/O
+3. 可配置 batch_size 以平衡速度和显存
+4. 只计算 action loss（L1），不包括 KL loss
+
+性能优化：
+- 启用 num_workers > 0 进行并行数据加载
+- 使用 pin_memory=True 加速 CPU→GPU 传输
+- 使用 prefetch_factor 预取数据减少等待时间
 """
 
 import torch
@@ -24,6 +30,8 @@ def compute_anchor_losses(
     batch_size: int = 64,
     device: str = "cuda",
     show_progress: bool = True,
+    num_workers: int = 4,
+    prefetch_factor: int = 2,
 ) -> np.ndarray:
     """
     计算所有 anchor 的 action loss（L1 loss）
@@ -31,9 +39,11 @@ def compute_anchor_losses(
     参数：
         model: ACT 策略模型（应处于 eval 模式）
         dataset: EpisodicDataset（anchor 模式，即 dataset.anchors is not None）
-        batch_size: 批量大小（越大越快，但需要更多显存）
+        batch_size: 批量大小（越大越快，但需要更多显存，默认 64）
         device: 计算设备 ("cuda" 或 "cpu")
         show_progress: 是否显示进度条
+        num_workers: DataLoader 工作进程数（默认 4，设为 0 禁用多进程）
+        prefetch_factor: 每个 worker 预取的 batch 数（默认 2）
         
     返回：
         losses: shape=(num_anchors,) 的 numpy 数组，每个元素是对应 anchor 的 L1 loss
@@ -41,36 +51,58 @@ def compute_anchor_losses(
     注意：
         - 此函数会将模型设为 eval 模式，计算完成后恢复为 train 模式
         - 使用 torch.no_grad() 避免梯度计算
+        - 使用多进程加载可显著提升性能，但会占用更多内存
+        
+    性能建议：
+        - 如果磁盘 I/O 慢，增加 num_workers (如 8 或 16)
+        - 如果显存充足，增加 batch_size (如 256 或 512)
+        - 如果内存不足，减少 num_workers 和 prefetch_factor
     """
     was_training = model.training
     model.eval()
     
-    # 创建顺序 DataLoader（不 shuffle，保证索引对应）
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,  # 避免多进程问题
-        pin_memory=True,
-    )
+    # 配置 DataLoader 参数
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,  # 保持顺序以对应 anchor 索引
+        "pin_memory": True,  # 加速 CPU→GPU 传输
+        "drop_last": False,  # 保留最后一个不完整的 batch
+    }
+    
+    # 多进程加载（仅在 num_workers > 0 时启用 prefetch）
+    if num_workers > 0:
+        loader_kwargs["num_workers"] = num_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["persistent_workers"] = True  # 保持 worker 进程活跃
+    else:
+        loader_kwargs["num_workers"] = 0
+    
+    loader = DataLoader(dataset, **loader_kwargs)
     
     all_losses = []
     
-    iterator = tqdm(loader, desc="计算 anchor losses") if show_progress else loader
+    iterator = tqdm(loader, desc="计算 anchor losses", unit="batch") if show_progress else loader
     
     with torch.no_grad():
         for batch in iterator:
             image_data, qpos_data, action_data, is_pad = batch
-            image_data = image_data.to(device)
-            qpos_data = qpos_data.to(device)
-            action_data = action_data.to(device)
-            is_pad = is_pad.to(device)
+            
+            # 将数据移到 GPU
+            image_data = image_data.to(device, non_blocking=True)
+            qpos_data = qpos_data.to(device, non_blocking=True)
+            action_data = action_data.to(device, non_blocking=True)
+            is_pad = is_pad.to(device, non_blocking=True)
             
             # 调用模型获取 per-sample loss
             per_sample_losses = _compute_per_sample_l1(
                 model, qpos_data, image_data, action_data, is_pad
             )
+            
+            # 立即转移到 CPU 并转换为 numpy，释放 GPU 内存
             all_losses.append(per_sample_losses.cpu().numpy())
+            
+            # 清理，避免内存泄漏
+            del image_data, qpos_data, action_data, is_pad, per_sample_losses
     
     if was_training:
         model.train()
@@ -140,6 +172,8 @@ def compute_anchor_losses_batched(
     batch_size: int = 64,
     device: str = "cuda",
     show_progress: bool = True,
+    num_workers: int = 4,
+    prefetch_factor: int = 2,
 ) -> np.ndarray:
     """
     使用自定义 forward 函数计算 anchor losses
@@ -149,27 +183,38 @@ def compute_anchor_losses_batched(
     参数：
         forward_fn: 前向函数，签名为 (batch) -> per_sample_losses: Tensor (B,)
         dataset: EpisodicDataset
-        batch_size: 批量大小
+        batch_size: 批量大小（默认 64）
         device: 计算设备
         show_progress: 是否显示进度条
+        num_workers: DataLoader 工作进程数（默认 4）
+        prefetch_factor: 每个 worker 预取的 batch 数（默认 2）
         
     返回：
         losses: shape=(num_anchors,) 的 numpy 数组
     """
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "pin_memory": True,
+        "drop_last": False,
+    }
+    
+    if num_workers > 0:
+        loader_kwargs["num_workers"] = num_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["persistent_workers"] = True
+    else:
+        loader_kwargs["num_workers"] = 0
+    
+    loader = DataLoader(dataset, **loader_kwargs)
     
     all_losses = []
-    iterator = tqdm(loader, desc="计算 anchor losses") if show_progress else loader
+    iterator = tqdm(loader, desc="计算 anchor losses", unit="batch") if show_progress else loader
     
     with torch.no_grad():
         for batch in iterator:
             per_sample_losses = forward_fn(batch)
             all_losses.append(per_sample_losses.cpu().numpy())
+            del per_sample_losses
     
     return np.concatenate(all_losses)

@@ -130,6 +130,8 @@ def rlas_weight_update_hook(
         batch_size=rlas_state.config.scoring_batch_size,
         device=device,
         show_progress=True,
+        num_workers=rlas_state.config.scoring_num_workers,
+        prefetch_factor=rlas_state.config.scoring_prefetch_factor,
     )
     
     # 更新权重
@@ -203,7 +205,19 @@ def add_rlas_args(parser) -> None:
         "--rlas_scoring_batch_size",
         type=int,
         default=64,
-        help="RLAS 计算 anchor loss 时的 batch size（默认 64）",
+        help="RLAS 计算 anchor loss 时的 batch size（默认 64，保持显存占用不变）",
+    )
+    rlas_group.add_argument(
+        "--rlas_scoring_num_workers",
+        type=int,
+        default=4,
+        help="RLAS 数据加载工作进程数（默认 4，设为 0 禁用多进程）",
+    )
+    rlas_group.add_argument(
+        "--rlas_scoring_prefetch_factor",
+        type=int,
+        default=2,
+        help="RLAS 每个 worker 预取的 batch 数（默认 2）",
     )
     rlas_group.add_argument(
         "--rlas_save_snapshots",

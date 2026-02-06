@@ -135,7 +135,11 @@ def get_args_parser():
     parser.add_argument("--rlas_ema_beta", action="store", type=float, required=False, default=0.5)
     parser.add_argument("--rlas_alpha", action="store", type=float, required=False, default=1.0)
     parser.add_argument("--rlas_scoring_batch_size", action="store", type=int, required=False, default=64)
+    parser.add_argument("--rlas_scoring_num_workers", action="store", type=int, required=False, default=4)
+    parser.add_argument("--rlas_scoring_prefetch_factor", action="store", type=int, required=False, default=2)
     parser.add_argument("--rlas_save_snapshots", action="store_true")
+    parser.add_argument("--rlas_enable_viz", action="store_true")
+    parser.add_argument("--rlas_disable_viz", action="store_true")
     # parser.add_argument('--num_queries',type=int, required=True)
     # parser.add_argument('--actionsByQuery',type=int, required=True)
 
