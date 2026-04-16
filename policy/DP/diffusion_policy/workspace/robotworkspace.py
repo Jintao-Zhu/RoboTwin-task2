@@ -59,17 +59,20 @@ class RobotWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
         seed = cfg.training.seed
         head_camera_type = cfg.head_camera_type
-        target_updates = cfg.training.get("target_updates", None)
-        save_every_updates = cfg.training.get("save_every_updates", None)
-        save_init_checkpoint = bool(cfg.training.get("save_init_checkpoint", True))
-        if target_updates is not None:
-            target_updates = int(target_updates)
-            if target_updates < 0:
-                raise ValueError("training.target_updates must be >= 0")
-        if save_every_updates is not None:
-            save_every_updates = int(save_every_updates)
-            if save_every_updates <= 0:
-                raise ValueError("training.save_every_updates must be > 0")
+        target_updates = cfg.training.target_updates
+        save_every_updates = cfg.training.save_every_updates
+        save_init_checkpoint = cfg.training.save_init_checkpoint
+        staged_mode = target_updates is not None
+
+        stage_ckpt_dir = None
+        if staged_mode:
+            if save_every_updates is None or int(save_every_updates) <= 0:
+                raise ValueError("training.save_every_updates must be a positive integer when training.target_updates is set.")
+            task_name = str(cfg.task.name)
+            task_config = str(cfg.setting)
+            expert_data_num = str(cfg.expert_data_num)
+            stage_ckpt_dir = pathlib.Path("checkpoints") / task_name / f"{task_config}-u{int(target_updates)}-{expert_data_num}-seed{seed}"
+            stage_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # resume training
         if cfg.training.resume:
@@ -94,15 +97,13 @@ class RobotWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
-        default_num_training_steps = (len(train_dataloader) * cfg.training.num_epochs) // cfg.training.gradient_accumulate_every
-        scheduler_num_training_steps = default_num_training_steps
-        if target_updates is not None:
-            scheduler_num_training_steps = max(1, target_updates)
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=scheduler_num_training_steps,
+            num_training_steps=int(target_updates) if staged_mode else (
+                (len(train_dataloader) * cfg.training.num_epochs) // cfg.training.gradient_accumulate_every
+            ),
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
             last_epoch=self.global_step - 1,
@@ -156,41 +157,17 @@ class RobotWorkspace(BaseWorkspace):
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
 
-        stage_ckpt_dir = None
-        if target_updates is not None:
-            task_name = cfg.task_name
-            task_config = cfg.setting if cfg.setting is not None else "default"
-            expert_data_num = cfg.expert_data_num if cfg.expert_data_num is not None else "na"
-            stage_ckpt_dir = pathlib.Path("checkpoints").joinpath(
-                str(task_name),
-                f"{task_config}-u{target_updates}-{expert_data_num}-seed{seed}",
-            )
-            stage_ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-        def save_stage_update_checkpoint(update_step):
-            if stage_ckpt_dir is None:
-                return None
-            ckpt_path = stage_ckpt_dir / f"policy_update_{update_step}_seed_{seed}.ckpt"
-            self.save_checkpoint(path=ckpt_path, use_thread=False)
-            return ckpt_path
-
-        def save_stage_last_checkpoint():
-            if stage_ckpt_dir is None:
-                return None
-            ckpt_path = stage_ckpt_dir / "policy_last.ckpt"
-            self.save_checkpoint(path=ckpt_path, use_thread=False)
-            return ckpt_path
-
-        if target_updates is not None and save_init_checkpoint and self.global_step == 0:
-            save_stage_update_checkpoint(0)
-
-        self.optimizer.zero_grad()
-        stop_training = target_updates is not None and self.global_step >= target_updates
-
         # training loop
         log_path = os.path.join(self.output_dir, "logs.json.txt")
 
         with JsonLogger(log_path) as json_logger:
+            if staged_mode and save_init_checkpoint and self.global_step == 0:
+                init_ckpt_path = stage_ckpt_dir / f"policy_update_0_seed_{seed}.ckpt"
+                self.save_checkpoint(path=init_ckpt_path, use_thread=False)
+
+            self.optimizer.zero_grad()
+            stop_training = staged_mode and (self.global_step >= int(target_updates))
+
             for local_epoch_idx in range(cfg.training.num_epochs):
                 if stop_training:
                     break
@@ -208,6 +185,9 @@ class RobotWorkspace(BaseWorkspace):
                         mininterval=cfg.training.tqdm_interval_sec,
                 ) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
+                        if staged_mode and self.global_step >= int(target_updates):
+                            stop_training = True
+                            break
                         batch = dataset.postprocess(batch, device)
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
@@ -216,21 +196,26 @@ class RobotWorkspace(BaseWorkspace):
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
-                        # step optimizer
-                        should_step = ((batch_idx + 1) % cfg.training.gradient_accumulate_every == 0)
+                        is_last_batch = batch_idx == (len(train_dataloader) - 1)
+                        should_step = ((batch_idx + 1) % cfg.training.gradient_accumulate_every == 0) or is_last_batch
+
+                        # step optimizer and update-based counters
                         if should_step:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
                             self.global_step += 1
 
-                            # update ema after optimizer update
+                            # update ema on optimizer step
                             if cfg.training.use_ema:
                                 ema.step(self.model)
 
-                            if (target_updates is not None and save_every_updates is not None
-                                    and self.global_step % save_every_updates == 0):
-                                save_stage_update_checkpoint(self.global_step)
+                            if staged_mode and (self.global_step % int(save_every_updates) == 0):
+                                update_ckpt_path = stage_ckpt_dir / f"policy_update_{self.global_step}_seed_{seed}.ckpt"
+                                self.save_checkpoint(path=update_ckpt_path, use_thread=False)
+
+                            if staged_mode and self.global_step >= int(target_updates):
+                                stop_training = True
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -243,17 +228,14 @@ class RobotWorkspace(BaseWorkspace):
                             "lr": lr_scheduler.get_last_lr()[0],
                         }
 
-                        is_last_batch = batch_idx == (len(train_dataloader) - 1)
-                        if not is_last_batch:
+                        if (not is_last_batch) and (not stop_training):
                             # log of last step is combined with validation and rollout
                             json_logger.log(step_log)
 
                         if (cfg.training.max_train_steps
                                 is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
                             break
-
-                        if target_updates is not None and self.global_step >= target_updates:
-                            stop_training = True
+                        if stop_training:
                             break
 
                 # at the end of each epoch
@@ -275,7 +257,7 @@ class RobotWorkspace(BaseWorkspace):
                 #     step_log.update(runner_log)
 
                 # run validation
-                if (not stop_training) and ((self.epoch % cfg.training.val_every) == 0):
+                if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
                         with tqdm.tqdm(
@@ -297,7 +279,7 @@ class RobotWorkspace(BaseWorkspace):
                             step_log["val_loss"] = val_loss
 
                 # run diffusion sampling on a training batch
-                if (not stop_training) and ((self.epoch % cfg.training.sample_every) == 0):
+                if ((self.epoch % cfg.training.sample_every) == 0) and (train_sampling_batch is not None):
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = train_sampling_batch
@@ -316,38 +298,23 @@ class RobotWorkspace(BaseWorkspace):
                         del mse
 
                 # checkpoint
-                if target_updates is None and ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
+                if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
                     # checkpointing
-                    dataset_cfg = self.cfg.task.dataset
-                    save_base = pathlib.Path(dataset_cfg.zarr_path).stem
-                    # 根据标签来源决定保存目录名称
-                    if getattr(dataset_cfg, "mix_expert_action", False):
-                        if getattr(dataset_cfg, "add_expert_noise", False):
-                            mode_tag = "with_rdt_mix_noise"
-                        else:
-                            mode_tag = "with_rdt_mix"
-                    elif getattr(dataset_cfg, "use_expert_action", False):
-                        if getattr(dataset_cfg, "add_expert_noise", False):
-                            mode_tag = "expert_noise"
-                        else:
-                            mode_tag = "expert_only"
-                    else:
-                        mode_tag = "with_rdt_only"
-                    save_name = f"{save_base}_{mode_tag}"
-                    self.save_checkpoint(f"checkpoints/{save_name}/{self.epoch + 1}.ckpt")
+                    save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
+                    self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch + 1}.ckpt")  # TODO
 
                 # ========= eval end for this epoch ==========
                 policy.train()
 
                 # end of epoch
                 # log of last step is combined with validation and rollout
+                step_log.setdefault("global_step", self.global_step)
+                step_log.setdefault("epoch", self.epoch)
                 json_logger.log(step_log)
                 self.epoch += 1
 
-        if target_updates is not None:
-            if (save_every_updates is None) or (self.global_step % save_every_updates != 0):
-                save_stage_update_checkpoint(self.global_step)
-            save_stage_last_checkpoint()
+            if staged_mode:
+                self.save_checkpoint(path=stage_ckpt_dir / "policy_last.ckpt", use_thread=False)
 
 
 class BatchSampler:

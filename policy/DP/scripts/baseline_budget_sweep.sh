@@ -3,17 +3,19 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage:
+用法：
   bash policy/DP/scripts/baseline_budget_sweep.sh \
     <task_name> <task_config> <expert_data_num> <seed> <gpu_id> "<budgets>"
 
-Example:
+示例：
   bash policy/DP/scripts/baseline_budget_sweep.sh \
     open_laptop demo_clean 200 0 0 "0 30000 60000 120000"
 
-Optional environment variables:
-  SAVE_EVERY_UPDATES   default: 30000
-  SWEEP_TAG            default: YYYYMMDD_HHMMSS
+可选环境变量：
+  SAVE_EVERY_UPDATES   默认 30000
+  SWEEP_TAG            默认 YYYYMMDD_HHMMSS
+  SKIP_TRAIN           默认 0（=1 时跳过训练，仅做阶段链接 + 评测 + summary）
+  HEAD_CAMERA_TYPE     默认 D435
 USAGE
 }
 
@@ -30,236 +32,219 @@ gpu_id="$5"
 budgets_raw="$6"
 
 save_every_updates="${SAVE_EVERY_UPDATES:-30000}"
+skip_train="${SKIP_TRAIN:-0}"
 sweep_tag="${SWEEP_TAG:-$(date +%Y%m%d_%H%M%S)}"
+head_camera_type="${HEAD_CAMERA_TYPE:-D435}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dp_dir="$(cd "${script_dir}/.." && pwd)"
 repo_root="$(cd "${dp_dir}/../.." && pwd)"
 
-mapfile -t budgets < <(
-  echo "${budgets_raw}" \
-    | tr ',' ' ' \
-    | awk '{for (i=1; i<=NF; ++i) print $i}' \
-    | rg '^[0-9]+$' \
-    | sort -n -u
-)
-
-if [[ ${#budgets[@]} -eq 0 ]]; then
-  echo "No valid budgets parsed from: ${budgets_raw}"
+if ! [[ "${save_every_updates}" =~ ^[0-9]+$ ]] || (( save_every_updates <= 0 )); then
+  echo "SAVE_EVERY_UPDATES 必须是正整数，当前值：${save_every_updates}"
   exit 1
 fi
 
-if ! [[ "${save_every_updates}" =~ ^[0-9]+$ ]] || (( save_every_updates <= 0 )); then
-  echo "SAVE_EVERY_UPDATES must be a positive integer, got: ${save_every_updates}"
+# 解析 budgets：支持空格/逗号分隔，过滤空项，去重并升序
+mapfile -t budgets < <(
+  echo "${budgets_raw}" \
+    | tr ',' ' ' \
+    | awk '{for (i=1; i<=NF; i++) print $i}' \
+    | grep -E '^[0-9]+$' \
+    | sort -n \
+    | awk '!seen[$0]++'
+)
+
+if [[ ${#budgets[@]} -eq 0 ]]; then
+  echo "budgets 解析失败：${budgets_raw}"
   exit 1
 fi
 
 max_budget="${budgets[$(( ${#budgets[@]} - 1 ))]}"
+
 for b in "${budgets[@]}"; do
   if (( b < 0 )); then
-    echo "Invalid budget (must be >= 0): ${b}"
+    echo "budget 非法（必须 >= 0）：${b}"
     exit 1
   fi
-  if (( b > 0 && b % save_every_updates != 0 )); then
-    echo "Budget ${b} is not divisible by SAVE_EVERY_UPDATES=${save_every_updates}."
+  if (( b > 0 )) && (( b % save_every_updates != 0 )); then
+    echo "budget ${b} 不能被 SAVE_EVERY_UPDATES=${save_every_updates} 整除。"
     exit 1
   fi
 done
 
 cd "${dp_dir}"
-export CUDA_VISIBLE_DEVICES="${gpu_id}"
-export PYTHONUNBUFFERED=1
-export HYDRA_FULL_ERROR=1
 
-dataset_rel="data/${task_name}-${task_config}-${expert_data_num}.zarr"
-if [[ ! -d "${dataset_rel}" ]]; then
+dataset_path="data/${task_name}-${task_config}-${expert_data_num}.zarr"
+if [[ ! -d "${dataset_path}" ]]; then
+  echo "未找到数据集 ${dataset_path}，开始自动处理数据。"
   bash process_data.sh "${task_name}" "${task_config}" "${expert_data_num}"
 fi
 
-action_dim="$(
-python3 - "${dataset_rel}" <<'PY'
-import sys
-
-path = sys.argv[1]
-dim = None
-try:
-    import zarr
-    root = zarr.open(path, mode="r")
-
-    for key in ("action", "state", "data/action", "data/state"):
-        try:
-            arr = root[key]
-            if hasattr(arr, "shape") and len(arr.shape) > 0:
-                dim = int(arr.shape[-1])
-                break
-        except Exception:
-            pass
-
-    if dim is None:
-        def walk(group, prefix=""):
-            for key in group.keys():
-                item = group[key]
-                name = f"{prefix}{key}"
-                if hasattr(item, "shape"):
-                    yield name, item
-                else:
-                    try:
-                        yield from walk(item, prefix=f"{name}/")
-                    except Exception:
-                        pass
-
-        for name, item in walk(root):
-            lname = name.lower()
-            if "action" in lname or lname.endswith("state"):
-                if len(item.shape) > 0:
-                    dim = int(item.shape[-1])
-                    break
-except Exception:
-    pass
-
-if dim is None:
-    print("")
-else:
-    print(dim)
-PY
-)"
-
-if [[ "${action_dim}" != "14" && "${action_dim}" != "16" ]]; then
-  echo "Failed to infer valid action_dim (14/16) from ${dataset_rel}; got: ${action_dim:-<empty>}"
+if [[ ! -d "${dataset_path}" ]]; then
+  echo "数据处理后仍未找到 ${dataset_path}"
   exit 1
 fi
 
-config_name="robot_dp_${action_dim}.yaml"
-train_ckpt_setting="${task_config}-u${max_budget}"
-train_ckpt_dir="${dp_dir}/checkpoints/${task_name}/${train_ckpt_setting}-${expert_data_num}-seed${seed}"
+action_dim="$(python - "${dataset_path}" <<'PY'
+import sys
+import zarr
 
-train_log_dir="${dp_dir}/logs/${task_name}/${train_ckpt_setting}-${expert_data_num}-seed${seed}"
-mkdir -p "${train_log_dir}"
-train_log="${train_log_dir}/train_${sweep_tag}.log"
+path = sys.argv[1]
+root = zarr.open(path, mode='r')
+keys = ("data/action", "action", "data/state", "state")
+for key in keys:
+    try:
+        arr = root[key]
+        print(int(arr.shape[-1]))
+        raise SystemExit(0)
+    except Exception:
+        pass
+raise SystemExit(1)
+PY
+)"
 
-summary_dir="${dp_dir}/logs/${task_name}/sweeps/${task_config}-${expert_data_num}-seed${seed}/${sweep_tag}"
+if [[ "${action_dim}" == "14" ]]; then
+  config_name="robot_dp_14"
+elif [[ "${action_dim}" == "16" ]]; then
+  config_name="robot_dp_16"
+else
+  echo "仅支持 action_dim=14/16，当前推断值：${action_dim}"
+  exit 1
+fi
+
+base_ckpt_setting="${task_config}-u${max_budget}"
+base_ckpt_dir="checkpoints/${task_name}/${base_ckpt_setting}-${expert_data_num}-seed${seed}"
+base_log_dir="logs/${task_name}/${base_ckpt_setting}-${expert_data_num}-seed${seed}"
+mkdir -p "${base_log_dir}"
+
+train_log="${base_log_dir}/train_${sweep_tag}.log"
+hydra_run_dir="${base_log_dir}/hydra_${sweep_tag}"
+logs_json_path="${hydra_run_dir}/logs.json.txt"
+
+summary_dir="logs/${task_name}/sweeps/${task_config}-${expert_data_num}-seed${seed}/${sweep_tag}"
 mkdir -p "${summary_dir}"
 summary_csv="${summary_dir}/summary.csv"
 summary_json="${summary_dir}/summary.json"
-records_tsv="${summary_dir}/records.tsv"
 
 echo "budget,ckpt_setting,ckpt_dir,ckpt_path,train_log,eval_log,success_fraction,success_percent,result_path,train_seconds,eval_seconds" > "${summary_csv}"
-: > "${records_tsv}"
 
-train_start_ts="$(date +%s)"
-python3 train.py --config-name="${config_name}" \
-  task.name="${task_name}" \
-  task.dataset.zarr_path="${dataset_rel}" \
-  training.debug=False \
-  training.seed="${seed}" \
-  training.device="cuda:0" \
-  exp_name="${task_name}-robot_dp-baseline-sweep" \
-  logging.mode=online \
-  setting="${task_config}" \
-  expert_data_num="${expert_data_num}" \
-  head_camera_type=D435 \
-  training.target_updates="${max_budget}" \
-  training.save_every_updates="${save_every_updates}" \
-  training.resume=False \
-  task.dataset.use_expert_action=True \
-  task.dataset.mix_expert_action=False \
-  task.dataset.add_expert_noise=False \
-  2>&1 | tee "${train_log}"
-train_end_ts="$(date +%s)"
-train_seconds="$(( train_end_ts - train_start_ts ))"
+train_seconds=""
 
-if [[ ! -d "${train_ckpt_dir}" ]]; then
-  echo "Training checkpoint directory not found: ${train_ckpt_dir}"
+export CUDA_VISIBLE_DEVICES="${gpu_id}"
+export PYTHONUNBUFFERED=1
+
+if [[ "${skip_train}" != "1" ]]; then
+  echo "[sweep] 训练一次到最大 budget=${max_budget}（save_every_updates=${save_every_updates}）"
+  train_start_ts="$(date +%s)"
+  python train.py \
+    --config-name="${config_name}.yaml" \
+    task.name="${task_name}" \
+    task.dataset.zarr_path="${dataset_path}" \
+    training.debug=False \
+    training.seed="${seed}" \
+    training.device="cuda:0" \
+    training.target_updates="${max_budget}" \
+    training.save_every_updates="${save_every_updates}" \
+    training.save_init_checkpoint=True \
+    training.resume=False \
+    setting="${task_config}" \
+    expert_data_num="${expert_data_num}" \
+    head_camera_type="${head_camera_type}" \
+    hydra.run.dir="${hydra_run_dir}" \
+    2>&1 | tee "${train_log}"
+  train_end_ts="$(date +%s)"
+  train_seconds="$(( train_end_ts - train_start_ts ))"
+else
+  echo "[sweep] SKIP_TRAIN=1，跳过训练，仅做阶段链接 + 评测 + 汇总。"
+fi
+
+if [[ ! -d "${base_ckpt_dir}" ]]; then
+  echo "未找到 base checkpoint 目录：${base_ckpt_dir}"
+  exit 1
+fi
+
+if [[ ! -f "${base_ckpt_dir}/policy_last.ckpt" ]]; then
+  echo "缺少 ${base_ckpt_dir}/policy_last.ckpt"
   exit 1
 fi
 
 strip_ansi() {
-  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+  sed -E 's/\x1B\[[0-9;]*[mK]//g'
 }
 
 parse_eval_metrics() {
   local eval_log_file="$1"
-  local sr_line
-  sr_line="$(tr '\r' '\n' < "${eval_log_file}" | strip_ansi | rg "Success rate:" | tail -n 1 || true)"
+  local last_sr
   local frac
-  frac="$(echo "${sr_line}" | sed -n 's/.*Success rate: *\([0-9]\+\/[0-9]\+\).*/\1/p')"
   local pct
-  pct="$(echo "${sr_line}" | sed -n 's/.*=> *\([0-9.]\+%\).*/\1/p')"
   local result_path
-  result_path="$(tr '\r' '\n' < "${eval_log_file}" | strip_ansi | rg "Data has been saved to " | tail -n 1 | sed 's/.*Data has been saved to //')"
-  echo -e "${frac}\t${pct}\t${result_path}"
+
+  last_sr="$(tr '\r' '\n' < "${eval_log_file}" | strip_ansi | grep -E 'Success rate:' | tail -n 1 || true)"
+  frac="$(echo "${last_sr}" | sed -n 's/.*Success rate: *\([0-9]\+\/[0-9]\+\).*/\1/p')"
+  pct="$(echo "${last_sr}" | sed -n 's/.*=> *\([0-9.]\+%\).*/\1/p')"
+  result_path="$(tr '\r' '\n' < "${eval_log_file}" | strip_ansi | grep -E 'Data has been saved to ' | tail -n 1 | sed 's/.*Data has been saved to //' || true)"
+
+  echo "${frac},${pct},${result_path}"
 }
 
 for b in "${budgets[@]}"; do
   ckpt_setting="${task_config}-u${b}"
-  stage_ckpt_dir="${dp_dir}/checkpoints/${task_name}/${ckpt_setting}-${expert_data_num}-seed${seed}"
-  mkdir -p "${stage_ckpt_dir}"
+  stage_ckpt_dir="checkpoints/${task_name}/${ckpt_setting}-${expert_data_num}-seed${seed}"
+  log_dir="logs/${task_name}/${ckpt_setting}-${expert_data_num}-seed${seed}"
+  mkdir -p "${log_dir}"
 
-  stage_src_ckpt="${train_ckpt_dir}/policy_update_${b}_seed_${seed}.ckpt"
-  if [[ ! -f "${stage_src_ckpt}" ]]; then
-    echo "Missing checkpoint for budget ${b}: ${stage_src_ckpt}"
-    exit 1
+  if (( b == max_budget )); then
+    ckpt_path="${base_ckpt_dir}/policy_last.ckpt"
+  else
+    src_ckpt="${base_ckpt_dir}/policy_update_${b}_seed_${seed}.ckpt"
+    if [[ ! -f "${src_ckpt}" ]]; then
+      echo "缺少 budget=${b} 对应 checkpoint：${src_ckpt}"
+      exit 1
+    fi
+    mkdir -p "${stage_ckpt_dir}"
+    ln -sf "$(realpath "${src_ckpt}")" "${stage_ckpt_dir}/policy_last.ckpt"
+    ckpt_path="${stage_ckpt_dir}/policy_last.ckpt"
   fi
 
-  stage_ckpt_path="${stage_ckpt_dir}/policy_last.ckpt"
-  ln -sfn "$(realpath "${stage_src_ckpt}")" "${stage_ckpt_path}"
+  eval_log="${log_dir}/eval_${sweep_tag}.log"
 
-  eval_log_dir="${dp_dir}/logs/${task_name}/${ckpt_setting}-${expert_data_num}-seed${seed}"
-  mkdir -p "${eval_log_dir}"
-  eval_log="${eval_log_dir}/eval_${sweep_tag}.log"
-
+  echo "[sweep] 开始评测 budget=${b}"
   eval_start_ts="$(date +%s)"
-  bash eval.sh "${task_name}" "${task_config}" "${ckpt_setting}" "${expert_data_num}" "${seed}" "${gpu_id}" "${stage_ckpt_path}" \
+  bash eval.sh "${task_name}" "${task_config}" "${ckpt_setting}" "${expert_data_num}" "${seed}" "${gpu_id}" "${ckpt_path}" \
     2>&1 | tee "${eval_log}"
   eval_end_ts="$(date +%s)"
   eval_seconds="$(( eval_end_ts - eval_start_ts ))"
 
-  IFS=$'\t' read -r success_fraction success_percent result_path < <(parse_eval_metrics "${eval_log}")
+  IFS=',' read -r success_fraction success_percent result_path < <(parse_eval_metrics "${eval_log}")
 
-  echo "${b},${ckpt_setting},${stage_ckpt_dir},${stage_ckpt_path},${train_log},${eval_log},${success_fraction},${success_percent},${result_path},${train_seconds},${eval_seconds}" >> "${summary_csv}"
-  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "${b}" "${ckpt_setting}" "${stage_ckpt_dir}" "${stage_ckpt_path}" "${train_log}" "${eval_log}" \
-    "${success_fraction}" "${success_percent}" "${result_path}" "${train_seconds}" "${eval_seconds}" >> "${records_tsv}"
+  echo "${b},${ckpt_setting},${stage_ckpt_dir},${ckpt_path},${train_log},${eval_log},${success_fraction},${success_percent},${result_path},${train_seconds},${eval_seconds}" >> "${summary_csv}"
 done
 
-budgets_joined="$(IFS=,; echo "${budgets[*]}")"
-python3 - "${summary_json}" "${task_name}" "${task_config}" "${expert_data_num}" "${seed}" "${max_budget}" "${save_every_updates}" "${budgets_joined}" "${records_tsv}" <<'PY'
+python - "${summary_csv}" "${summary_json}" "${task_name}" "${task_config}" "${expert_data_num}" "${seed}" "${max_budget}" "${save_every_updates}" "${train_log}" "${logs_json_path}" "${budgets[@]}" <<'PY'
+import csv
 import json
 import sys
 
-summary_json = sys.argv[1]
-task_name = sys.argv[2]
-task_config = sys.argv[3]
-expert_data_num = int(sys.argv[4])
-seed = int(sys.argv[5])
-max_budget = int(sys.argv[6])
-save_every_updates = int(sys.argv[7])
-budgets = [int(x) for x in sys.argv[8].split(",") if x]
-records_tsv = sys.argv[9]
+summary_csv = sys.argv[1]
+summary_json = sys.argv[2]
+task_name = sys.argv[3]
+task_config = sys.argv[4]
+expert_data_num = int(sys.argv[5])
+seed = int(sys.argv[6])
+max_budget = int(sys.argv[7])
+save_every_updates = int(sys.argv[8])
+train_log = sys.argv[9]
+logs_json_path = sys.argv[10]
+budgets = [int(x) for x in sys.argv[11:]]
 
 records = []
-with open(records_tsv, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        (budget, ckpt_setting, ckpt_dir, ckpt_path, train_log, eval_log, success_fraction, success_percent,
-         result_path, train_seconds, eval_seconds) = line.split("\t")
-        records.append({
-            "budget": int(budget),
-            "ckpt_setting": ckpt_setting,
-            "ckpt_dir": ckpt_dir,
-            "ckpt_path": ckpt_path,
-            "train_log": train_log,
-            "eval_log": eval_log,
-            "success_fraction": success_fraction,
-            "success_percent": success_percent,
-            "result_path": result_path,
-            "train_seconds": int(train_seconds) if train_seconds else None,
-            "eval_seconds": int(eval_seconds) if eval_seconds else None,
-        })
+with open(summary_csv, "r", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        records.append(row)
 
-data = {
+payload = {
     "task_name": task_name,
     "task_config": task_config,
     "expert_data_num": expert_data_num,
@@ -267,13 +252,17 @@ data = {
     "max_budget": max_budget,
     "save_every_updates": save_every_updates,
     "budgets": budgets,
+    "train_log": train_log,
+    "logs_json_path": logs_json_path,
     "records": records,
 }
 
 with open(summary_json, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+    json.dump(payload, f, ensure_ascii=False, indent=2)
 PY
 
-echo "[baseline sweep] done"
-echo "summary.csv: ${summary_csv}"
-echo "summary.json: ${summary_json}"
+echo "[sweep] 完成"
+echo "[sweep] train_log: ${train_log}"
+echo "[sweep] logs.json.txt: ${logs_json_path}"
+echo "[sweep] summary.csv: ${summary_csv}"
+echo "[sweep] summary.json: ${summary_json}"

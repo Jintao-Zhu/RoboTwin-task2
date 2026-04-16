@@ -6,8 +6,6 @@ expert_data_num=${3}
 seed=${4}
 action_dim=${5}
 gpu_id=${6}
-target_updates=${TARGET_UPDATES:-}
-save_every_updates=${SAVE_EVERY_UPDATES:-}
 
 head_camera_type=D435
 
@@ -41,14 +39,6 @@ if [ ! -d "./data/${task_name}-${task_config}-${expert_data_num}.zarr" ]; then
     bash process_data.sh ${task_name} ${task_config} ${expert_data_num}
 fi
 
-extra_args=()
-if [ -n "${target_updates}" ]; then
-    extra_args+=("training.target_updates=${target_updates}")
-fi
-if [ -n "${save_every_updates}" ]; then
-    extra_args+=("training.save_every_updates=${save_every_updates}")
-fi
-
 python train.py --config-name=${config_name}.yaml \
                             task.name=${task_name} \
                             task.dataset.zarr_path="data/${task_name}-${task_config}-${expert_data_num}.zarr" \
@@ -59,7 +49,6 @@ python train.py --config-name=${config_name}.yaml \
                             logging.mode=${wandb_mode} \
                             setting=${task_config} \
                             expert_data_num=${expert_data_num} \
-                            head_camera_type=$head_camera_type \
-                            "${extra_args[@]}"
+                            head_camera_type=$head_camera_type
                             # checkpoint.save_ckpt=${save_ckpt}
                             # hydra.run.dir=${run_dir} \

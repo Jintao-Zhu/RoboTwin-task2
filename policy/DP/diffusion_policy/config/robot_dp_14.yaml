@@ -73,14 +73,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 0
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 0
   shuffle: False
   pin_memory: True
@@ -105,7 +105,7 @@ training:
   gradient_accumulate_every: 1
   target_updates: null
   save_every_updates: null
-  save_init_checkpoint: True
+  save_init_checkpoint: true
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True

@@ -16,8 +16,8 @@ echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
 cd ../..
 
-eval_args=(
-    --config "policy/$policy_name/deploy_policy.yml"
+cmd=(
+    python script/eval_policy.py --config policy/$policy_name/deploy_policy.yml
     --overrides
     --task_name "${task_name}"
     --task_config "${task_config}"
@@ -27,8 +27,7 @@ eval_args=(
 )
 
 if [[ -n "${ckpt_path}" ]]; then
-    eval_args+=(--ckpt_path "${ckpt_path}")
+    cmd+=(--ckpt_path "${ckpt_path}")
 fi
 
-PYTHONWARNINGS=ignore::UserWarning \
-python script/eval_policy.py "${eval_args[@]}"
+PYTHONWARNINGS=ignore::UserWarning "${cmd[@]}"
