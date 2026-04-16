@@ -8,4 +8,5 @@ instruction_type: unseen
 
 expert_data_num: null
 checkpoint_num: 600
+ckpt_path: null
 head_camera_type: D435

@@ -59,6 +59,17 @@ class RobotWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
         seed = cfg.training.seed
         head_camera_type = cfg.head_camera_type
+        target_updates = cfg.training.get("target_updates", None)
+        save_every_updates = cfg.training.get("save_every_updates", None)
+        save_init_checkpoint = bool(cfg.training.get("save_init_checkpoint", True))
+        if target_updates is not None:
+            target_updates = int(target_updates)
+            if target_updates < 0:
+                raise ValueError("training.target_updates must be >= 0")
+        if save_every_updates is not None:
+            save_every_updates = int(save_every_updates)
+            if save_every_updates <= 0:
+                raise ValueError("training.save_every_updates must be > 0")
 
         # resume training
         if cfg.training.resume:
@@ -83,12 +94,15 @@ class RobotWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        default_num_training_steps = (len(train_dataloader) * cfg.training.num_epochs) // cfg.training.gradient_accumulate_every
+        scheduler_num_training_steps = default_num_training_steps
+        if target_updates is not None:
+            scheduler_num_training_steps = max(1, target_updates)
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(len(train_dataloader) * cfg.training.num_epochs) //
-            cfg.training.gradient_accumulate_every,
+            num_training_steps=scheduler_num_training_steps,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
             last_epoch=self.global_step - 1,
@@ -142,11 +156,44 @@ class RobotWorkspace(BaseWorkspace):
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
 
+        stage_ckpt_dir = None
+        if target_updates is not None:
+            task_name = cfg.task_name
+            task_config = cfg.setting if cfg.setting is not None else "default"
+            expert_data_num = cfg.expert_data_num if cfg.expert_data_num is not None else "na"
+            stage_ckpt_dir = pathlib.Path("policy/DP/checkpoints").joinpath(
+                str(task_name),
+                f"{task_config}-u{target_updates}-{expert_data_num}-seed{seed}",
+            )
+            stage_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        def save_stage_update_checkpoint(update_step):
+            if stage_ckpt_dir is None:
+                return None
+            ckpt_path = stage_ckpt_dir / f"policy_update_{update_step}_seed_{seed}.ckpt"
+            self.save_checkpoint(path=ckpt_path, use_thread=False)
+            return ckpt_path
+
+        def save_stage_last_checkpoint():
+            if stage_ckpt_dir is None:
+                return None
+            ckpt_path = stage_ckpt_dir / "policy_last.ckpt"
+            self.save_checkpoint(path=ckpt_path, use_thread=False)
+            return ckpt_path
+
+        if target_updates is not None and save_init_checkpoint and self.global_step == 0:
+            save_stage_update_checkpoint(0)
+
+        self.optimizer.zero_grad()
+        stop_training = target_updates is not None and self.global_step >= target_updates
+
         # training loop
         log_path = os.path.join(self.output_dir, "logs.json.txt")
 
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
+                if stop_training:
+                    break
                 step_log = dict()
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
@@ -170,14 +217,20 @@ class RobotWorkspace(BaseWorkspace):
                         loss.backward()
 
                         # step optimizer
-                        if (self.global_step % cfg.training.gradient_accumulate_every == 0):
+                        should_step = ((batch_idx + 1) % cfg.training.gradient_accumulate_every == 0)
+                        if should_step:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
+                            self.global_step += 1
 
-                        # update ema
-                        if cfg.training.use_ema:
-                            ema.step(self.model)
+                            # update ema after optimizer update
+                            if cfg.training.use_ema:
+                                ema.step(self.model)
+
+                            if (target_updates is not None and save_every_updates is not None
+                                    and self.global_step % save_every_updates == 0):
+                                save_stage_update_checkpoint(self.global_step)
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -194,16 +247,20 @@ class RobotWorkspace(BaseWorkspace):
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             json_logger.log(step_log)
-                            self.global_step += 1
 
                         if (cfg.training.max_train_steps
                                 is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
                             break
 
+                        if target_updates is not None and self.global_step >= target_updates:
+                            stop_training = True
+                            break
+
                 # at the end of each epoch
                 # replace train_loss with epoch average
-                train_loss = np.mean(train_losses)
-                step_log["train_loss"] = train_loss
+                if len(train_losses) > 0:
+                    train_loss = np.mean(train_losses)
+                    step_log["train_loss"] = train_loss
 
                 # ========= eval for this epoch ==========
                 policy = self.model
@@ -218,7 +275,7 @@ class RobotWorkspace(BaseWorkspace):
                 #     step_log.update(runner_log)
 
                 # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
+                if (not stop_training) and ((self.epoch % cfg.training.val_every) == 0):
                     with torch.no_grad():
                         val_losses = list()
                         with tqdm.tqdm(
@@ -240,7 +297,7 @@ class RobotWorkspace(BaseWorkspace):
                             step_log["val_loss"] = val_loss
 
                 # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
+                if (not stop_training) and ((self.epoch % cfg.training.sample_every) == 0):
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = train_sampling_batch
@@ -259,7 +316,7 @@ class RobotWorkspace(BaseWorkspace):
                         del mse
 
                 # checkpoint
-                if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
+                if target_updates is None and ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
                     # checkpointing
                     dataset_cfg = self.cfg.task.dataset
                     save_base = pathlib.Path(dataset_cfg.zarr_path).stem
@@ -285,8 +342,12 @@ class RobotWorkspace(BaseWorkspace):
                 # end of epoch
                 # log of last step is combined with validation and rollout
                 json_logger.log(step_log)
-                self.global_step += 1
                 self.epoch += 1
+
+        if target_updates is not None:
+            if (save_every_updates is None) or (self.global_step % save_every_updates != 0):
+                save_stage_update_checkpoint(self.global_step)
+            save_stage_last_checkpoint()
 
 
 class BatchSampler:

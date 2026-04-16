@@ -103,6 +103,9 @@ training:
   lr_warmup_steps: 500
   num_epochs: 600
   gradient_accumulate_every: 1
+  target_updates: null
+  save_every_updates: null
+  save_init_checkpoint: True
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True
