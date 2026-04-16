@@ -161,7 +161,7 @@ class RobotWorkspace(BaseWorkspace):
             task_name = cfg.task_name
             task_config = cfg.setting if cfg.setting is not None else "default"
             expert_data_num = cfg.expert_data_num if cfg.expert_data_num is not None else "na"
-            stage_ckpt_dir = pathlib.Path("policy/DP/checkpoints").joinpath(
+            stage_ckpt_dir = pathlib.Path("checkpoints").joinpath(
                 str(task_name),
                 f"{task_config}-u{target_updates}-{expert_data_num}-seed{seed}",
             )
