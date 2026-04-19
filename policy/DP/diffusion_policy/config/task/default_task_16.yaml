@@ -48,3 +48,5 @@ dataset:
   seed: 42
   val_ratio: 0.02
   max_train_episodes: null
+  sampling_plan_path: null
+  sampling_plan_verify_sha256: true

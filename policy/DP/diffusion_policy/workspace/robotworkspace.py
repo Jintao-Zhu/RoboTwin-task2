@@ -350,6 +350,45 @@ class BatchSampler:
         return self.num_batch
 
 
+class WeightedBatchSampler:
+
+    def __init__(
+        self,
+        data_size: int,
+        batch_size: int,
+        weights,
+        seed: int = 0,
+        drop_last: bool = True,
+    ):
+        assert drop_last
+        self.data_size = int(data_size)
+        self.batch_size = int(batch_size)
+        self.num_batch = self.data_size // self.batch_size
+        self.total_samples = self.num_batch * self.batch_size
+        self.rng = np.random.default_rng(seed)
+
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape != (self.data_size,):
+            raise ValueError(f"weights shape mismatch: expected ({self.data_size},), got {weights.shape}")
+        if not np.all(np.isfinite(weights)):
+            raise ValueError("weights contain non-finite values.")
+        if np.any(weights < 0):
+            raise ValueError("weights must be non-negative.")
+        weight_sum = float(weights.sum())
+        if weight_sum <= 0:
+            raise ValueError("weights sum must be > 0.")
+        self.prob = weights / weight_sum
+
+    def __iter__(self):
+        sampled = self.rng.choice(self.data_size, size=self.total_samples, replace=True, p=self.prob)
+        sampled = sampled.reshape(self.num_batch, self.batch_size)
+        for i in range(self.num_batch):
+            yield sampled[i]
+
+    def __len__(self):
+        return self.num_batch
+
+
 def create_dataloader(
     dataset,
     *,
@@ -360,7 +399,20 @@ def create_dataloader(
     persistent_workers: bool,
     seed: int = 0,
 ):
-    batch_sampler = BatchSampler(len(dataset), batch_size, shuffle=shuffle, seed=seed, drop_last=True)
+    sample_weights = None
+    if hasattr(dataset, "get_train_sample_weights"):
+        sample_weights = dataset.get_train_sample_weights()
+
+    if shuffle and sample_weights is not None:
+        batch_sampler = WeightedBatchSampler(
+            len(dataset),
+            batch_size,
+            weights=sample_weights,
+            seed=seed,
+            drop_last=True,
+        )
+    else:
+        batch_sampler = BatchSampler(len(dataset), batch_size, shuffle=shuffle, seed=seed, drop_last=True)
 
     def collate(x):
         assert len(x) == 1

@@ -3,6 +3,7 @@ import numba
 import torch
 import numpy as np
 import copy
+from pathlib import Path
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import (
@@ -13,6 +14,7 @@ from diffusion_policy.common.sampler import (
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.common.normalize_util import get_image_range_normalizer
+from sampling_plan import SamplingPlan
 import pdb
 
 
@@ -28,6 +30,8 @@ class RobotImageDataset(BaseImageDataset):
         val_ratio=0.0,
         batch_size=128,
         max_train_episodes=None,
+        sampling_plan_path=None,
+        sampling_plan_verify_sha256=True,
     ):
 
         super().__init__()
@@ -52,6 +56,10 @@ class RobotImageDataset(BaseImageDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.seed = seed
+        self.val_ratio = val_ratio
+        self.max_train_episodes = max_train_episodes
+        self.zarr_path = zarr_path
 
         self.batch_size = batch_size
         sequence_length = self.sampler.sequence_length
@@ -63,6 +71,17 @@ class RobotImageDataset(BaseImageDataset):
         for v in self.buffers_torch.values():
             v.pin_memory()
 
+        self.plan_dataset_indices = None
+        self.plan_weights = None
+        self.plan_stage_ids = None
+        self.sampling_plan_path = None
+        self.sampling_plan_meta = None
+
+        if sampling_plan_path is not None:
+            plan = SamplingPlan.load(sampling_plan_path, verify_sha256=sampling_plan_verify_sha256)
+            self._validate_sampling_plan_meta(plan.meta)
+            self._attach_sampling_plan(plan, sampling_plan_path)
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
@@ -73,6 +92,11 @@ class RobotImageDataset(BaseImageDataset):
             episode_mask=~self.train_mask,
         )
         val_set.train_mask = ~self.train_mask
+        val_set.plan_dataset_indices = None
+        val_set.plan_weights = None
+        val_set.plan_stage_ids = None
+        val_set.sampling_plan_path = None
+        val_set.sampling_plan_meta = None
         return val_set
 
     def get_normalizer(self, mode="limits", **kwargs):
@@ -89,6 +113,8 @@ class RobotImageDataset(BaseImageDataset):
         return normalizer
 
     def __len__(self) -> int:
+        if self.plan_dataset_indices is not None:
+            return len(self.plan_dataset_indices)
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
@@ -114,17 +140,22 @@ class RobotImageDataset(BaseImageDataset):
         if isinstance(idx, slice):
             raise NotImplementedError  # Specialized
         elif isinstance(idx, int):
+            if self.plan_dataset_indices is not None:
+                idx = int(self.plan_dataset_indices[idx])
             sample = self.sampler.sample_sequence(idx)
             sample = dict_apply(sample, torch.from_numpy)
             return sample
         elif isinstance(idx, np.ndarray):
             assert len(idx) == self.batch_size
+            base_idx = idx
+            if self.plan_dataset_indices is not None:
+                base_idx = self.plan_dataset_indices[idx]
             for k, v in self.sampler.replay_buffer.items():
                 batch_sample_sequence(
                     self.buffers[k],
                     v,
                     self.sampler.indices,
-                    idx,
+                    base_idx,
                     self.sampler.sequence_length,
                 )
             return self.buffers_torch
@@ -148,6 +179,66 @@ class RobotImageDataset(BaseImageDataset):
             },
             "action": action,  # B, T, D
         }
+
+    def get_train_sample_weights(self):
+        return self.plan_weights
+
+    def _attach_sampling_plan(self, plan: SamplingPlan, sampling_plan_path):
+        sampler_indices = self.sampler.indices.astype(np.int64, copy=False)
+        key_to_idx = {}
+        for i, row in enumerate(sampler_indices):
+            key_to_idx[(int(row[0]), int(row[1]), int(row[2]), int(row[3]))] = i
+
+        n = len(plan.buffer_start_idx)
+        mapped = np.empty((n,), dtype=np.int64)
+        for i in range(n):
+            key = (
+                int(plan.buffer_start_idx[i]),
+                int(plan.buffer_end_idx[i]),
+                int(plan.sample_start_idx[i]),
+                int(plan.sample_end_idx[i]),
+            )
+            if key not in key_to_idx:
+                raise ValueError(f"Sampling plan window not found in current train sampler: {key}")
+            mapped[i] = key_to_idx[key]
+
+        self.plan_dataset_indices = mapped
+        self.plan_weights = plan.weights.astype(np.float32, copy=False)
+        self.plan_stage_ids = plan.stage_ids.astype(np.int32, copy=False)
+        self.sampling_plan_path = str(sampling_plan_path)
+        self.sampling_plan_meta = dict(plan.meta)
+
+    def _validate_sampling_plan_meta(self, meta: dict):
+        expected = {
+            "zarr_path": self.zarr_path,
+            "horizon": self.horizon,
+            "pad_before": self.pad_before,
+            "pad_after": self.pad_after,
+            "seed": self.seed,
+            "val_ratio": self.val_ratio,
+            "max_train_episodes": self.max_train_episodes,
+        }
+        for k, v in expected.items():
+            if k not in meta:
+                raise ValueError(f"Sampling plan meta missing required key: {k}")
+
+            if k == "zarr_path":
+                got = str(meta[k])
+                a = Path(str(v)).expanduser().resolve()
+                b = Path(got).expanduser().resolve()
+                if a != b:
+                    raise ValueError(f"Sampling plan meta mismatch for {k}: expected={v}, got={got}")
+            elif k == "val_ratio":
+                if float(meta[k]) != float(v):
+                    raise ValueError(f"Sampling plan meta mismatch for {k}: expected={v}, got={meta[k]}")
+            elif k == "max_train_episodes":
+                mv = None if meta[k] is None else int(meta[k])
+                ev = None if v is None else int(v)
+                if mv != ev:
+                    raise ValueError(f"Sampling plan meta mismatch for {k}: expected={ev}, got={mv}")
+            else:
+                if int(meta[k]) != int(v):
+                    raise ValueError(f"Sampling plan meta mismatch for {k}: expected={v}, got={meta[k]}")
 
 
 def _batch_sample_sequence(

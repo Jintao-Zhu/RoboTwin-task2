@@ -4,11 +4,11 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 用法：
-  bash policy/DP/scripts/baseline_budget_sweep.sh \
+  bash policy/DP/scripts/plan_budget_sweep.sh \
     <task_name> <task_config> <expert_data_num> <seed> <gpu_id> "<budgets>"
 
 示例：
-  bash policy/DP/scripts/baseline_budget_sweep.sh \
+  bash policy/DP/scripts/plan_budget_sweep.sh \
     open_laptop demo_clean 200 0 0 "0 30000 60000 120000"
 
 可选环境变量：
@@ -45,7 +45,6 @@ if ! [[ "${save_every_updates}" =~ ^[0-9]+$ ]] || (( save_every_updates <= 0 ));
   exit 1
 fi
 
-# 解析 budgets：支持空格/逗号分隔，过滤空项，去重并升序
 mapfile -t budgets < <(
   echo "${budgets_raw}" \
     | tr ',' ' ' \
@@ -113,7 +112,44 @@ else
   exit 1
 fi
 
-base_ckpt_setting="${task_config}-u${max_budget}"
+read -r horizon pad_before pad_after dataset_seed dataset_val_ratio dataset_max_train_episodes < <(
+  python - "${dp_dir}/diffusion_policy/config/${config_name}.yaml" "${dp_dir}/diffusion_policy/config/task/default_task_${action_dim}.yaml" <<'PY'
+import sys
+import yaml
+
+config_path = sys.argv[1]
+task_path = sys.argv[2]
+with open(config_path, 'r', encoding='utf-8') as f:
+    cfg = yaml.safe_load(f)
+with open(task_path, 'r', encoding='utf-8') as f:
+    task_cfg = yaml.safe_load(f)
+
+horizon = int(cfg['horizon'])
+pad_before = int(cfg['n_obs_steps']) - 1
+pad_after = int(cfg['n_action_steps']) - 1
+seed = int(task_cfg['dataset']['seed'])
+val_ratio = float(task_cfg['dataset']['val_ratio'])
+max_train_episodes = task_cfg['dataset']['max_train_episodes']
+max_train_episodes = 'null' if max_train_episodes is None else str(int(max_train_episodes))
+print(horizon, pad_before, pad_after, seed, val_ratio, max_train_episodes)
+PY
+)
+
+if [[ "${dataset_max_train_episodes}" == "null" ]]; then
+  max_train_arg=(--max_train_episodes)
+  max_train_value=(null)
+else
+  max_train_arg=(--max_train_episodes)
+  max_train_value=("${dataset_max_train_episodes}")
+fi
+
+plan_tag="static-s2g4"
+setting_tag="${task_config}-${plan_tag}"
+
+plan_dir="plans/${task_name}/${setting_tag}-${expert_data_num}-seed${seed}"
+mkdir -p "${plan_dir}"
+
+base_ckpt_setting="${setting_tag}-u${max_budget}"
 base_ckpt_dir="checkpoints/${task_name}/${base_ckpt_setting}-${expert_data_num}-seed${seed}"
 base_log_dir="logs/${task_name}/${base_ckpt_setting}-${expert_data_num}-seed${seed}"
 mkdir -p "${base_log_dir}"
@@ -122,12 +158,47 @@ train_log="${base_log_dir}/train_${sweep_tag}.log"
 hydra_run_dir="${base_log_dir}/hydra_${sweep_tag}"
 logs_json_path="${hydra_run_dir}/logs.json.txt"
 
-summary_dir="logs/${task_name}/sweeps/${task_config}-${expert_data_num}-seed${seed}/${sweep_tag}"
+summary_dir="logs/${task_name}/sweeps/${setting_tag}-${expert_data_num}-seed${seed}/${sweep_tag}"
 mkdir -p "${summary_dir}"
 summary_csv="${summary_dir}/summary.csv"
 summary_json="${summary_dir}/summary.json"
 
-echo "budget,ckpt_setting,ckpt_dir,ckpt_path,train_log,eval_log,success_fraction,success_percent,result_path,train_seconds,eval_seconds" > "${summary_csv}"
+build_plan_log="${summary_dir}/build_plan_${sweep_tag}.log"
+
+echo "budget,ckpt_setting,ckpt_dir,ckpt_path,plan_dir,train_log,eval_log,success_fraction,success_percent,result_path,train_seconds,eval_seconds" > "${summary_csv}"
+
+if [[ ! -f "${plan_dir}/plan_meta.json" || ! -f "${plan_dir}/plan_arrays.npz" ]]; then
+  echo "[plan] 构建静态采样计划：${plan_dir}"
+  if [[ "${dataset_max_train_episodes}" == "null" ]]; then
+    python scripts/build_sampling_plan.py \
+      --zarr_path "${dataset_path}" \
+      --out_dir "${plan_dir}" \
+      --horizon "${horizon}" \
+      --pad_before "${pad_before}" \
+      --pad_after "${pad_after}" \
+      --seed "${dataset_seed}" \
+      --val_ratio "${dataset_val_ratio}" \
+      2>&1 | tee "${build_plan_log}"
+  else
+    python scripts/build_sampling_plan.py \
+      --zarr_path "${dataset_path}" \
+      --out_dir "${plan_dir}" \
+      --horizon "${horizon}" \
+      --pad_before "${pad_before}" \
+      --pad_after "${pad_after}" \
+      --seed "${dataset_seed}" \
+      --val_ratio "${dataset_val_ratio}" \
+      --max_train_episodes "${dataset_max_train_episodes}" \
+      2>&1 | tee "${build_plan_log}"
+  fi
+else
+  echo "[plan] 复用已有采样计划：${plan_dir}"
+fi
+
+if [[ ! -f "${plan_dir}/plan_meta.json" || ! -f "${plan_dir}/plan_arrays.npz" ]]; then
+  echo "缺少 plan 文件：${plan_dir}/plan_meta.json 或 plan_arrays.npz"
+  exit 1
+fi
 
 train_seconds=""
 
@@ -135,24 +206,52 @@ export CUDA_VISIBLE_DEVICES="${gpu_id}"
 export PYTHONUNBUFFERED=1
 
 if [[ "${skip_train}" != "1" ]]; then
-  echo "[sweep] 训练一次到最大 budget=${max_budget}（save_every_updates=${save_every_updates}）"
+  echo "[sweep] 使用 plan 训练一次到最大 budget=${max_budget}（save_every_updates=${save_every_updates}）"
   train_start_ts="$(date +%s)"
-  python train.py \
-    --config-name="${config_name}.yaml" \
-    task.name="${task_name}" \
-    task.dataset.zarr_path="${dataset_path}" \
-    training.debug=False \
-    training.seed="${seed}" \
-    training.device="cuda:0" \
-    training.target_updates="${max_budget}" \
-    training.save_every_updates="${save_every_updates}" \
-    training.save_init_checkpoint=True \
-    training.resume=False \
-    setting="${task_config}" \
-    expert_data_num="${expert_data_num}" \
-    head_camera_type="${head_camera_type}" \
-    hydra.run.dir="${hydra_run_dir}" \
-    2>&1 | tee "${train_log}"
+  if [[ "${dataset_max_train_episodes}" == "null" ]]; then
+    python train.py \
+      --config-name="${config_name}.yaml" \
+      task.name="${task_name}" \
+      task.dataset.zarr_path="${dataset_path}" \
+      task.dataset.seed="${dataset_seed}" \
+      task.dataset.val_ratio="${dataset_val_ratio}" \
+      task.dataset.sampling_plan_path="${plan_dir}" \
+      task.dataset.sampling_plan_verify_sha256=True \
+      training.debug=False \
+      training.seed="${seed}" \
+      training.device="cuda:0" \
+      training.target_updates="${max_budget}" \
+      training.save_every_updates="${save_every_updates}" \
+      training.save_init_checkpoint=True \
+      training.resume=False \
+      setting="${setting_tag}" \
+      expert_data_num="${expert_data_num}" \
+      head_camera_type="${head_camera_type}" \
+      hydra.run.dir="${hydra_run_dir}" \
+      2>&1 | tee "${train_log}"
+  else
+    python train.py \
+      --config-name="${config_name}.yaml" \
+      task.name="${task_name}" \
+      task.dataset.zarr_path="${dataset_path}" \
+      task.dataset.seed="${dataset_seed}" \
+      task.dataset.val_ratio="${dataset_val_ratio}" \
+      task.dataset.max_train_episodes="${dataset_max_train_episodes}" \
+      task.dataset.sampling_plan_path="${plan_dir}" \
+      task.dataset.sampling_plan_verify_sha256=True \
+      training.debug=False \
+      training.seed="${seed}" \
+      training.device="cuda:0" \
+      training.target_updates="${max_budget}" \
+      training.save_every_updates="${save_every_updates}" \
+      training.save_init_checkpoint=True \
+      training.resume=False \
+      setting="${setting_tag}" \
+      expert_data_num="${expert_data_num}" \
+      head_camera_type="${head_camera_type}" \
+      hydra.run.dir="${hydra_run_dir}" \
+      2>&1 | tee "${train_log}"
+  fi
   train_end_ts="$(date +%s)"
   train_seconds="$(( train_end_ts - train_start_ts ))"
 else
@@ -189,7 +288,7 @@ parse_eval_metrics() {
 }
 
 for b in "${budgets[@]}"; do
-  ckpt_setting="${task_config}-u${b}"
+  ckpt_setting="${setting_tag}-u${b}"
   stage_ckpt_dir="checkpoints/${task_name}/${ckpt_setting}-${expert_data_num}-seed${seed}"
   log_dir="logs/${task_name}/${ckpt_setting}-${expert_data_num}-seed${seed}"
   mkdir -p "${log_dir}"
@@ -218,10 +317,10 @@ for b in "${budgets[@]}"; do
 
   IFS=',' read -r success_fraction success_percent result_path < <(parse_eval_metrics "${eval_log}")
 
-  echo "${b},${ckpt_setting},${stage_ckpt_dir},${ckpt_path},${train_log},${eval_log},${success_fraction},${success_percent},${result_path},${train_seconds},${eval_seconds}" >> "${summary_csv}"
+  echo "${b},${ckpt_setting},${stage_ckpt_dir},${ckpt_path},${plan_dir},${train_log},${eval_log},${success_fraction},${success_percent},${result_path},${train_seconds},${eval_seconds}" >> "${summary_csv}"
 done
 
-python - "${summary_csv}" "${summary_json}" "${task_name}" "${task_config}" "${expert_data_num}" "${seed}" "${max_budget}" "${save_every_updates}" "${train_log}" "${logs_json_path}" "${budgets[@]}" <<'PY'
+python - "${summary_csv}" "${summary_json}" "${task_name}" "${task_config}" "${expert_data_num}" "${seed}" "${max_budget}" "${save_every_updates}" "${plan_dir}" "${train_log}" "${logs_json_path}" "${budgets[@]}" <<'PY'
 import csv
 import json
 import sys
@@ -234,9 +333,10 @@ expert_data_num = int(sys.argv[5])
 seed = int(sys.argv[6])
 max_budget = int(sys.argv[7])
 save_every_updates = int(sys.argv[8])
-train_log = sys.argv[9]
-logs_json_path = sys.argv[10]
-budgets = [int(x) for x in sys.argv[11:]]
+plan_dir = sys.argv[9]
+train_log = sys.argv[10]
+logs_json_path = sys.argv[11]
+budgets = [int(x) for x in sys.argv[12:]]
 
 records = []
 with open(summary_csv, "r", encoding="utf-8") as f:
@@ -251,6 +351,7 @@ payload = {
     "seed": seed,
     "max_budget": max_budget,
     "save_every_updates": save_every_updates,
+    "plan_dir": plan_dir,
     "budgets": budgets,
     "train_log": train_log,
     "logs_json_path": logs_json_path,
@@ -262,6 +363,7 @@ with open(summary_json, "w", encoding="utf-8") as f:
 PY
 
 echo "[sweep] 完成"
+echo "[sweep] plan_dir: ${plan_dir}"
 echo "[sweep] train_log: ${train_log}"
 echo "[sweep] logs.json.txt: ${logs_json_path}"
 echo "[sweep] summary.csv: ${summary_csv}"
