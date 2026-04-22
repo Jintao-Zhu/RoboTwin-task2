@@ -1,0 +1,16 @@
+- task.name=stack_blocks_three
+- task.dataset.zarr_path=data/stack_blocks_three-demo_clean-200.zarr
+- task.dataset.seed=42
+- task.dataset.val_ratio=0.02
+- task.dataset.sampling_plan_path=plans/stack_blocks_three/demo_clean-static-s2g4-200-seed0
+- task.dataset.sampling_plan_verify_sha256=True
+- training.debug=False
+- training.seed=0
+- training.device=cuda:0
+- training.target_updates=120000
+- training.save_every_updates=30000
+- training.save_init_checkpoint=True
+- training.resume=False
+- setting=demo_clean-static-s2g4
+- expert_data_num=200
+- head_camera_type=D435
