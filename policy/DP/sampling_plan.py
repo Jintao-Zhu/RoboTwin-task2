@@ -96,10 +96,13 @@ class SamplingPlan:
             raise ValueError("weights must be floating dtype.")
         if not np.all(np.isfinite(self.weights)):
             raise ValueError("weights contain non-finite values.")
-        if np.any(self.weights < 0):
-            raise ValueError("weights must be non-negative.")
-        if float(self.weights.sum()) <= 0:
-            raise ValueError("Sum of weights must be > 0.")
+        if np.any(self.weights <= 0):
+            raise ValueError("weights must be strictly positive.")
+        mean_w = float(self.weights.mean())
+        if not np.isfinite(mean_w):
+            raise ValueError("weights mean is not finite.")
+        if abs(mean_w - 1.0) > 1e-3:
+            raise ValueError(f"weights mean must be close to 1.0, got {mean_w:.6f}")
 
     def _arrays_bytes(self) -> bytes:
         buf = io.BytesIO()

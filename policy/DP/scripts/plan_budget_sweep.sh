@@ -9,7 +9,7 @@ usage() {
 
 示例：
   bash policy/DP/scripts/plan_budget_sweep.sh \
-    open_laptop demo_clean 200 0 0 "0 30000 60000 120000"
+    open_laptop demo_clean 200 0 0 "10000 30000 60000 120000"
 
 可选环境变量：
   SAVE_EVERY_UPDATES   默认 30000
@@ -143,7 +143,7 @@ else
   max_train_value=("${dataset_max_train_episodes}")
 fi
 
-plan_tag="static-s2g4"
+plan_tag="static-amix"
 setting_tag="${task_config}-${plan_tag}"
 
 plan_dir="plans/${task_name}/${setting_tag}-${expert_data_num}-seed${seed}"
@@ -168,7 +168,7 @@ build_plan_log="${summary_dir}/build_plan_${sweep_tag}.log"
 echo "budget,ckpt_setting,ckpt_dir,ckpt_path,plan_dir,train_log,eval_log,success_fraction,success_percent,result_path,train_seconds,eval_seconds" > "${summary_csv}"
 
 if [[ ! -f "${plan_dir}/plan_meta.json" || ! -f "${plan_dir}/plan_arrays.npz" ]]; then
-  echo "[plan] 构建静态采样计划：${plan_dir}"
+  echo "[plan] 构建 action-motion + uniform mix 静态采样计划：${plan_dir}"
   if [[ "${dataset_max_train_episodes}" == "null" ]]; then
     python scripts/build_sampling_plan.py \
       --zarr_path "${dataset_path}" \
