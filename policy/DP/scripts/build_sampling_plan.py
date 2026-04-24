@@ -89,8 +89,9 @@ def main() -> None:
     std_raw = float(raw_scores.std())
     scores = (raw_scores - mean_raw) / max(std_raw, 1e-8)
 
-    temperature = 0.7
-    uniform_mix = 0.2
+    temperature = 1.5
+    uniform_mix = 0.5
+    max_weight = 5.0
 
     logits = scores / temperature
     logits = logits - float(np.max(logits))
@@ -99,7 +100,10 @@ def main() -> None:
 
     uniform_prob = np.ones_like(biased_prob) / float(len(biased_prob))
     final_prob = (1.0 - uniform_mix) * biased_prob + uniform_mix * uniform_prob
+
     weights = final_prob / float(np.mean(final_prob))
+    weights = np.clip(weights, 1e-8, max_weight)
+    weights = weights / float(np.mean(weights))
     weights = weights.astype(np.float32)
 
     stage_ids = np.zeros((num_after,), dtype=np.int32)
@@ -117,6 +121,7 @@ def main() -> None:
         "score_formula": "mean_abs_diff + 0.3*mean_var",
         "temperature": temperature,
         "uniform_mix": uniform_mix,
+        "max_weight": max_weight,
         "num_anchors_before_filter": num_before,
         "num_anchors_after_filter": num_after,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -145,6 +150,9 @@ def main() -> None:
         f"min={float(raw_scores.min()):.6f}, "
         f"max={float(raw_scores.max()):.6f}"
     )
+    print(f"temperature: {temperature}")
+    print(f"uniform_mix: {uniform_mix}")
+    print(f"max_weight: {max_weight}")
     print(
         "weights stats: "
         f"mean={float(weights.mean()):.6f}, "
