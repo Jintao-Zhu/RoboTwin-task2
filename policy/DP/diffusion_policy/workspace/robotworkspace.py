@@ -389,6 +389,81 @@ class WeightedBatchSampler:
         return self.num_batch
 
 
+class MixedPriorityBatchSampler:
+
+    def __init__(
+        self,
+        data_size: int,
+        batch_size: int,
+        weights: np.ndarray,
+        seed: int,
+        priority_fraction: float = 0.2,
+        drop_last: bool = True,
+    ):
+        self.data_size = int(data_size)
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.rng = np.random.default_rng(seed)
+
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape != (self.data_size,):
+            raise ValueError(f"weights shape mismatch: expected ({self.data_size},), got {weights.shape}")
+        if not np.all(np.isfinite(weights)):
+            raise ValueError("weights contain non-finite values.")
+        if np.any(weights < 0):
+            raise ValueError("weights must be non-negative.")
+        weight_sum = float(weights.sum())
+        if weight_sum <= 0:
+            raise ValueError("weights sum must be > 0.")
+        self.prob = weights / weight_sum
+
+        pf = float(priority_fraction)
+        if pf <= 0.0 or pf >= 1.0:
+            raise ValueError("priority_fraction must be in (0, 1).")
+        self.num_priority = max(1, int(round(self.batch_size * pf)))
+        self.num_uniform = self.batch_size - self.num_priority
+        if self.num_uniform <= 0:
+            raise ValueError("priority_fraction too large for current batch_size.")
+
+        if self.drop_last:
+            self.num_batch = self.data_size // self.batch_size
+        else:
+            self.num_batch = int(np.ceil(self.data_size / float(self.batch_size)))
+
+    def __iter__(self):
+        uniform_perm = self.rng.permutation(self.data_size)
+        cursor = 0
+
+        for _ in range(self.num_batch):
+            need = self.num_uniform
+            chunks = []
+            while need > 0:
+                remain = self.data_size - cursor
+                if remain <= 0:
+                    uniform_perm = self.rng.permutation(self.data_size)
+                    cursor = 0
+                    remain = self.data_size
+                take = min(need, remain)
+                chunks.append(uniform_perm[cursor:cursor + take])
+                cursor += take
+                need -= take
+            uniform_idx = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+
+            priority_idx = self.rng.choice(
+                self.data_size,
+                size=self.num_priority,
+                replace=True,
+                p=self.prob,
+            )
+
+            batch = np.concatenate([uniform_idx, priority_idx], axis=0)
+            self.rng.shuffle(batch)
+            yield batch.astype(np.int64)
+
+    def __len__(self):
+        return self.num_batch
+
+
 def create_dataloader(
     dataset,
     *,
@@ -404,11 +479,12 @@ def create_dataloader(
         sample_weights = dataset.get_train_sample_weights()
 
     if shuffle and sample_weights is not None:
-        batch_sampler = WeightedBatchSampler(
-            len(dataset),
-            batch_size,
+        batch_sampler = MixedPriorityBatchSampler(
+            data_size=len(dataset),
+            batch_size=batch_size,
             weights=sample_weights,
             seed=seed,
+            priority_fraction=0.2,
             drop_last=True,
         )
     else:

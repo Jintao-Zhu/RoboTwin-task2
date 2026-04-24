@@ -75,14 +75,24 @@ def main() -> None:
 
     num_after = int(indices.shape[0])
 
-    raw_scores = np.empty((num_after,), dtype=np.float64)
+    actions_list = []
     for i in range(num_after):
         sampled = sampler.sample_sequence(i)
         action = np.asarray(sampled["action"], dtype=np.float64)
-        t_steps = int(action.shape[0]) if action.ndim >= 1 else 0
+        actions_list.append(action)
 
-        diff_score = float(np.mean(np.abs(action[1:] - action[:-1]))) if t_steps >= 2 else 0.0
-        var_score = float(np.mean(np.var(action, axis=0))) if t_steps >= 1 else 0.0
+    all_actions = np.concatenate(actions_list, axis=0)
+    action_mean = all_actions.mean(axis=0)
+    action_std = all_actions.std(axis=0)
+    action_std = np.maximum(action_std, 1e-6)
+
+    raw_scores = np.empty((num_after,), dtype=np.float64)
+    for i, action in enumerate(actions_list):
+        action_norm = (action - action_mean) / action_std
+        t_steps = int(action_norm.shape[0]) if action_norm.ndim >= 1 else 0
+
+        diff_score = float(np.mean(np.abs(action_norm[1:] - action_norm[:-1]))) if t_steps >= 2 else 0.0
+        var_score = float(np.mean(np.var(action_norm, axis=0))) if t_steps >= 1 else 0.0
         raw_scores[i] = diff_score + 0.3 * var_score
 
     mean_raw = float(raw_scores.mean())
@@ -117,11 +127,12 @@ def main() -> None:
         "seed": int(args.seed),
         "val_ratio": float(args.val_ratio),
         "max_train_episodes": None if args.max_train_episodes is None else int(args.max_train_episodes),
-        "score_type": "action_motion_only",
-        "score_formula": "mean_abs_diff + 0.3*mean_var",
+        "score_type": "normalized_action_motion_only",
+        "score_formula": "mean_abs_diff(normalized_action) + 0.3*mean_var(normalized_action)",
         "temperature": temperature,
         "uniform_mix": uniform_mix,
         "max_weight": max_weight,
+        "sampler_mix": "uniform_0.8_priority_0.2",
         "num_anchors_before_filter": num_before,
         "num_anchors_after_filter": num_after,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -149,6 +160,17 @@ def main() -> None:
         f"std={float(raw_scores.std()):.6f}, "
         f"min={float(raw_scores.min()):.6f}, "
         f"max={float(raw_scores.max()):.6f}"
+    )
+    print("score_type: normalized_action_motion_only")
+    print(
+        "action_mean range: "
+        f"min={float(action_mean.min()):.6f}, "
+        f"max={float(action_mean.max()):.6f}"
+    )
+    print(
+        "action_std range: "
+        f"min={float(action_std.min()):.6f}, "
+        f"max={float(action_std.max()):.6f}"
     )
     print(f"temperature: {temperature}")
     print(f"uniform_mix: {uniform_mix}")

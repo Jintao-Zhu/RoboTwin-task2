@@ -1,0 +1,10 @@
+total windows before filter: 42769
+total windows after filter: 42769
+raw_score stats: mean=0.007929, std=0.010745, min=0.000000, max=0.060775
+score_type: normalized_action_motion_only
+action_mean range: min=-0.325952, max=0.936763
+action_std range: min=0.250545, max=0.954637
+temperature: 1.5
+uniform_mix: 0.5
+max_weight: 5.0
+weights stats: mean=1.000000, std=0.623472, min=0.725531, max=5.047112

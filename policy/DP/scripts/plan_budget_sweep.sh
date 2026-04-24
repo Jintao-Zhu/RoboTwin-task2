@@ -143,7 +143,7 @@ else
   max_train_value=("${dataset_max_train_episodes}")
 fi
 
-plan_tag="static-amix-lite"
+plan_tag="static-namix"
 setting_tag="${task_config}-${plan_tag}"
 
 plan_dir="plans/${task_name}/${setting_tag}-${expert_data_num}-seed${seed}"
