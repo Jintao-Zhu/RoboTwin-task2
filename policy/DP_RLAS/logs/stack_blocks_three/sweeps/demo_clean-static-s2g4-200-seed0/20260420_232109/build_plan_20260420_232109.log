@@ -1,0 +1,12 @@
+total windows before stride: 93787
+total windows after stride: 46885
+per-stage counts:
+  stage 0: 11729
+  stage 1: 11686
+  stage 2: 11709
+  stage 3: 11761
+per-stage total weight:
+  stage 0: 11721.249023
+  stage 1: 11721.250000
+  stage 2: 11721.250000
+  stage 3: 11721.250000

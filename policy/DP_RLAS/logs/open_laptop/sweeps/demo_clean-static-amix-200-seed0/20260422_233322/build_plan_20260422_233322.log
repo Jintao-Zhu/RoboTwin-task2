@@ -1,0 +1,4 @@
+total windows before filter: 42769
+total windows after filter: 42769
+raw_score stats: mean=0.004121, std=0.005730, min=0.000000, max=0.029801
+weights stats: mean=1.000000, std=3.270789, min=0.241772, max=70.619431

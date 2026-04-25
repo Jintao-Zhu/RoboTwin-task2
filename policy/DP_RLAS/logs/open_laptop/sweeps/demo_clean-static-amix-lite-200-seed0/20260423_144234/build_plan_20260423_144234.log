@@ -1,0 +1,7 @@
+total windows before filter: 42769
+total windows after filter: 42769
+raw_score stats: mean=0.004121, std=0.005730, min=0.000000, max=0.029801
+temperature: 1.5
+uniform_mix: 0.5
+max_weight: 5.0
+weights stats: mean=1.000000, std=0.637724, min=0.723345, max=5.011201

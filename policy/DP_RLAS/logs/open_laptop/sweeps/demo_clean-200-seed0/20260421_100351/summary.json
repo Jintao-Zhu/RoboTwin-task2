@@ -1,0 +1,70 @@
+{
+  "task_name": "open_laptop",
+  "task_config": "demo_clean",
+  "expert_data_num": 200,
+  "seed": 0,
+  "max_budget": 120000,
+  "save_every_updates": 10000,
+  "budgets": [
+    10000,
+    30000,
+    60000,
+    120000
+  ],
+  "train_log": "logs/open_laptop/demo_clean-u120000-200-seed0/train_20260421_100351.log",
+  "logs_json_path": "logs/open_laptop/demo_clean-u120000-200-seed0/hydra_20260421_100351/logs.json.txt",
+  "records": [
+    {
+      "budget": "10000",
+      "ckpt_setting": "demo_clean-u10000",
+      "ckpt_dir": "checkpoints/open_laptop/demo_clean-u10000-200-seed0",
+      "ckpt_path": "/root/code/RoboTwin-task2/policy/DP/checkpoints/open_laptop/demo_clean-u120000-200-seed0/policy_update_10000_seed_0.ckpt",
+      "train_log": "logs/open_laptop/demo_clean-u120000-200-seed0/train_20260421_100351.log",
+      "eval_log": "logs/open_laptop/demo_clean-u10000-200-seed0/eval_20260421_100351.log",
+      "success_fraction": "52/100",
+      "success_percent": "52.0%",
+      "result_path": "eval_result/open_laptop/DP/demo_clean/demo_clean-u10000/2026-04-22 06:19:32/_result.txt",
+      "train_seconds": "72938",
+      "eval_seconds": "16146"
+    },
+    {
+      "budget": "30000",
+      "ckpt_setting": "demo_clean-u30000",
+      "ckpt_dir": "checkpoints/open_laptop/demo_clean-u30000-200-seed0",
+      "ckpt_path": "/root/code/RoboTwin-task2/policy/DP/checkpoints/open_laptop/demo_clean-u120000-200-seed0/policy_update_30000_seed_0.ckpt",
+      "train_log": "logs/open_laptop/demo_clean-u120000-200-seed0/train_20260421_100351.log",
+      "eval_log": "logs/open_laptop/demo_clean-u30000-200-seed0/eval_20260421_100351.log",
+      "success_fraction": "68/100",
+      "success_percent": "68.0%",
+      "result_path": "eval_result/open_laptop/DP/demo_clean/demo_clean-u30000/2026-04-22 10:48:37/_result.txt",
+      "train_seconds": "72938",
+      "eval_seconds": "13943"
+    },
+    {
+      "budget": "60000",
+      "ckpt_setting": "demo_clean-u60000",
+      "ckpt_dir": "checkpoints/open_laptop/demo_clean-u60000-200-seed0",
+      "ckpt_path": "/root/code/RoboTwin-task2/policy/DP/checkpoints/open_laptop/demo_clean-u120000-200-seed0/policy_update_60000_seed_0.ckpt",
+      "train_log": "logs/open_laptop/demo_clean-u120000-200-seed0/train_20260421_100351.log",
+      "eval_log": "logs/open_laptop/demo_clean-u60000-200-seed0/eval_20260421_100351.log",
+      "success_fraction": "70/100",
+      "success_percent": "70.0%",
+      "result_path": "eval_result/open_laptop/DP/demo_clean/demo_clean-u60000/2026-04-22 14:41:01/_result.txt",
+      "train_seconds": "72938",
+      "eval_seconds": "13718"
+    },
+    {
+      "budget": "120000",
+      "ckpt_setting": "demo_clean-u120000",
+      "ckpt_dir": "checkpoints/open_laptop/demo_clean-u120000-200-seed0",
+      "ckpt_path": "/root/code/RoboTwin-task2/policy/DP/checkpoints/open_laptop/demo_clean-u120000-200-seed0/policy_last.ckpt",
+      "train_log": "logs/open_laptop/demo_clean-u120000-200-seed0/train_20260421_100351.log",
+      "eval_log": "logs/open_laptop/demo_clean-u120000-200-seed0/eval_20260421_100351.log",
+      "success_fraction": "67/100",
+      "success_percent": "67.0%",
+      "result_path": "eval_result/open_laptop/DP/demo_clean/demo_clean-u120000/2026-04-22 18:29:40/_result.txt",
+      "train_seconds": "72938",
+      "eval_seconds": "14339"
+    }
+  ]
+}
