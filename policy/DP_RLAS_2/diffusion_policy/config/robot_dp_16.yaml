@@ -123,11 +123,13 @@ training:
     enabled: false
     warmup_updates: 10000
     update_interval: 10000
-    temperature: 1.5
+    temperature: 0.05
     epsilon_mix: 0.2
     ema_beta: 0.5
     scoring_seed: 12345
     snapshot_dirname: rlas_snapshots
+    group_size: 8
+    top_frac: 0.3
   # misc
   tqdm_interval_sec: 1.0
 

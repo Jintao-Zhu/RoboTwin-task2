@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import json
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -27,7 +28,8 @@ from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from rlas.rlas_core import RLASState
 from rlas.dp_anchor_scorer import DPAnchorScorer
-from rlas.dynamic_sampler import DynamicWeightedBatchSampler
+from rlas.group_index import build_window_groups
+from rlas.dynamic_sampler import DynamicGroupWeightedBatchSampler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -95,16 +97,29 @@ class RobotWorkspace(BaseWorkspace):
         if rlas_enabled:
             sampling_plan_path = cfg.task.dataset.get("sampling_plan_path", None)
             if sampling_plan_path is not None:
-                raise ValueError(
-                    "RLAS must run on native DP full train windows. "
-                    "Do not enable task.dataset.sampling_plan_path together with training.rlas.enabled=True."
-                )
+                raise ValueError("RLAS must run without static sampling_plan_path.")
+
+        rlas_group_info = None
+        if rlas_enabled:
+            group_size = int(rlas_cfg.get("group_size", 8))
+            window_to_group, group_to_indices, group_meta = build_window_groups(
+                dataset,
+                group_size=group_size,
+            )
+            print(f"[RLAS] built window groups: {group_meta}")
+
+            rlas_group_info = {
+                "window_to_group": window_to_group,
+                "group_to_indices": group_to_indices,
+                "group_meta": group_meta,
+            }
 
         rlas_sampler = None
         if rlas_enabled:
-            rlas_sampler = DynamicWeightedBatchSampler(
+            rlas_sampler = DynamicGroupWeightedBatchSampler(
                 data_size=len(dataset),
                 batch_size=cfg.dataloader.batch_size,
+                group_to_indices=rlas_group_info["group_to_indices"],
                 seed=seed,
                 drop_last=True,
             )
@@ -189,9 +204,12 @@ class RobotWorkspace(BaseWorkspace):
         if rlas_enabled:
             rlas_state = RLASState(
                 num_anchors=len(dataset),
+                window_to_group=rlas_group_info["window_to_group"],
+                group_to_indices=rlas_group_info["group_to_indices"],
                 temperature=float(rlas_cfg.temperature),
                 epsilon_mix=float(rlas_cfg.epsilon_mix),
                 ema_beta=float(rlas_cfg.ema_beta),
+                top_frac=float(rlas_cfg.get("top_frac", 0.3)),
             )
             rlas_scorer = DPAnchorScorer(
                 dataset=dataset,
@@ -204,6 +222,10 @@ class RobotWorkspace(BaseWorkspace):
             else:
                 rlas_snapshot_dir = pathlib.Path(self.output_dir) / str(rlas_cfg.snapshot_dirname)
             rlas_snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+            with open(rlas_snapshot_dir / "group_meta.json", "w", encoding="utf-8") as f:
+                json.dump(rlas_group_info["group_meta"], f, indent=2)
+            np.save(rlas_snapshot_dir / "window_to_group.npy", rlas_group_info["window_to_group"])
 
         # save batch for sampling
         train_sampling_batch = None
@@ -281,13 +303,13 @@ class RobotWorkspace(BaseWorkspace):
                                     print(f"[RLAS] scoring all anchors at update {self.global_step} ...")
                                     current_losses = rlas_scorer.score_all(self.model)
                                     if not rlas_state.initialized:
-                                        new_weights = rlas_state.initialize(current_losses, step=self.global_step)
+                                        new_group_weights = rlas_state.initialize(current_losses, step=self.global_step)
                                         print(f"[RLAS] initialized baseline losses at update {self.global_step}")
                                     else:
-                                        new_weights = rlas_state.update(current_losses, step=self.global_step)
+                                        new_group_weights = rlas_state.update(current_losses, step=self.global_step)
                                         print(f"[RLAS] updated weights at update {self.global_step}")
 
-                                    rlas_sampler.update_weights(new_weights)
+                                    rlas_sampler.update_weights(new_group_weights)
                                     rlas_state.save_snapshot(
                                         rlas_snapshot_dir,
                                         step=self.global_step,

@@ -112,7 +112,7 @@ else
   exit 1
 fi
 
-method_tag="rlas"
+method_tag="rlas-group"
 setting_tag="${task_config}-${method_tag}"
 
 base_ckpt_setting="${setting_tag}-u${max_budget}"
@@ -154,9 +154,11 @@ if [[ "${skip_train}" != "1" ]]; then
     training.rlas.enabled=True \
     training.rlas.warmup_updates=10000 \
     training.rlas.update_interval=10000 \
-    training.rlas.temperature=1.5 \
+    training.rlas.temperature=0.05 \
     training.rlas.epsilon_mix=0.2 \
     training.rlas.ema_beta=0.5 \
+    training.rlas.group_size=8 \
+    training.rlas.top_frac=0.3 \
     training.rlas.scoring_seed=12345 \
     setting="${setting_tag}" \
     expert_data_num="${expert_data_num}" \
