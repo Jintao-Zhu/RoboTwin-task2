@@ -353,6 +353,20 @@ class LeRobotKuavoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=False)
+class RLASConfig:
+    enabled: bool = False
+    warmup_steps: int = 10000
+    update_interval: int = 10000
+    temperature: float = 1.0
+    epsilon_mix: float = 0.1
+    ema_beta: float = 0.5
+    alpha: float = 1.0
+    scoring_batch_size: int | None = None
+    scoring_seed: int = 12345
+    snapshot_dirname: str = "rlas_snapshots"
+
+
+@dataclasses.dataclass(frozen=False)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -425,6 +439,9 @@ class TrainConfig:
     sampler_seed_override: int | None = None
     # 可选：覆盖 replacement（是否有放回采样）；若不设置则使用 plan_meta 里的 replacement。
     sampler_replacement_override: bool | None = None
+
+    # ACT-style RLAS：默认关闭，baseline/static sampling plan 不受影响。
+    rlas: RLASConfig = dataclasses.field(default_factory=RLASConfig)
 
     # 冻结策略（freeze：冻结参数不更新）。
     # - default：保持 config 里已有的 freeze_filter（baseline 不变）

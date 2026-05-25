@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 import openpi.training.augmentations as _augmentations
+from openpi.training.rlas import DynamicWeightedRandomSampler
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -172,15 +173,16 @@ def create_data_loader(
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     sampler = None
+
+    if config.rlas.enabled and not config.sampling_plan_path:
+        raise ValueError("pi0 RLAS requires --sampling-plan-path to define fixed anchors, matching ACT-RLAS.")
+
     if config.sampling_plan_path:
-        # Plan-STaR：启用采样计划文件后
-        # 1) 校验 plan 与当前训练数据/模型 horizon 一致
-        # 2) 用 plan.anchor_indices 对数据集做 Subset
-        # 3) 用 plan.weights 构造 WeightedRandomSampler（可选 replacement）
         from openpi.training.sampling_plan import SamplingPlan
 
         plan = SamplingPlan.load(config.sampling_plan_path, verify_sha256=True)
         meta = plan.meta
+
         if meta.get("repo_id") != data_config.repo_id:
             raise ValueError(
                 f"Sampling plan repo_id mismatch: plan={meta.get('repo_id')} config={data_config.repo_id}")
@@ -202,24 +204,29 @@ def create_data_loader(
         if np.any(plan.anchor_indices < 0) or np.any(plan.anchor_indices >= len(dataset)):
             raise ValueError("Sampling plan anchor_indices out of range for dataset.")
 
-        # 训练数据只保留 anchors（锚点起点）；后续 DataLoader 看到的 index 是 [0..len(anchors)-1]
         dataset = torch.utils.data.Subset(typing.cast(torch.utils.data.Dataset, dataset), plan.anchor_indices.tolist())
-        # replacement=True：有放回采样（少样本短训常用）
-        # replacement=False：无放回采样（更像按 epoch 覆盖一遍 anchors）
-        replacement = config.sampler_replacement_override if config.sampler_replacement_override is not None else bool(
-            meta.get("replacement", True))
-        # sampler_seed：控制 WeightedRandomSampler 的随机性（独立于 training seed，可用于复现实验）
-        sampler_seed = config.sampler_seed_override if config.sampler_seed_override is not None else int(
-            meta.get("sampler_seed", config.seed))
-        sampler_generator = torch.Generator()
-        sampler_generator.manual_seed(sampler_seed)
-        weights = torch.as_tensor(plan.weights, dtype=torch.double)
-        sampler = torch.utils.data.WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(weights),
-            replacement=replacement,
-            generator=sampler_generator,
-        )
+
+        if config.rlas.enabled:
+            sampler_seed = config.sampler_seed_override if config.sampler_seed_override is not None else int(
+                meta.get("sampler_seed", config.seed))
+            sampler = DynamicWeightedRandomSampler(
+                data_size=len(plan.anchor_indices),
+                seed=sampler_seed,
+            )
+        else:
+            replacement = config.sampler_replacement_override if config.sampler_replacement_override is not None else bool(
+                meta.get("replacement", True))
+            sampler_seed = config.sampler_seed_override if config.sampler_seed_override is not None else int(
+                meta.get("sampler_seed", config.seed))
+            sampler_generator = torch.Generator()
+            sampler_generator.manual_seed(sampler_seed)
+            weights = torch.as_tensor(plan.weights, dtype=torch.double)
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(weights),
+                replacement=replacement,
+                generator=sampler_generator,
+            )
 
     data_loader = TorchDataLoader(
         dataset,
@@ -241,6 +248,18 @@ def create_data_loader(
 
         def data_config(self) -> _config.DataConfig:
             return self._data_config
+
+        @property
+        def torch_loader(self):
+            return self._data_loader.torch_loader
+
+        @property
+        def dataset(self):
+            return self._data_loader.torch_loader.dataset
+
+        @property
+        def sampler(self):
+            return self._data_loader.torch_loader.sampler
 
         def __iter__(self):
             for batch in self._data_loader:

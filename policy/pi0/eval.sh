@@ -18,8 +18,9 @@ checkpoint_id=${7}
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
+echo "[env] using python: $(which python)"
+python -c "import sys; print('[env] executable:', sys.executable)"
 
-source .venv/bin/activate
 cd ../.. # move to root
 
 XLA_FLAGS="--xla_gpu_autotune_level=0" PYTHONWARNINGS=ignore::UserWarning \

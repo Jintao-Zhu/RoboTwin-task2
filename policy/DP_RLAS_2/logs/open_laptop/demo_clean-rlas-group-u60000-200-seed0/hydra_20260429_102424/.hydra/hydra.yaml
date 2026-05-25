@@ -1,0 +1,178 @@
+hydra:
+  run:
+    dir: logs/open_laptop/demo_clean-rlas-group-u60000-200-seed0/hydra_20260429_102424
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: RUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.run.dir=logs/open_laptop/demo_clean-rlas-group-u60000-200-seed0/hydra_20260429_102424
+    - hydra.mode=RUN
+    task:
+    - task.name=open_laptop
+    - task.dataset.zarr_path=data/open_laptop-demo_clean-200.zarr
+    - task.dataset.sampling_plan_path=null
+    - training.debug=False
+    - training.seed=0
+    - training.device=cuda:0
+    - training.target_updates=60000
+    - training.save_every_updates=10000
+    - training.save_init_checkpoint=True
+    - training.resume=False
+    - training.rlas.enabled=True
+    - training.rlas.warmup_updates=10000
+    - training.rlas.update_interval=10000
+    - training.rlas.temperature=0.05
+    - training.rlas.epsilon_mix=0.2
+    - training.rlas.ema_beta=0.5
+    - training.rlas.group_size=8
+    - training.rlas.top_frac=0.3
+    - training.rlas.scoring_seed=12345
+    - setting=demo_clean-rlas-group
+    - expert_data_num=200
+    - head_camera_type=D435
+  job:
+    name: train
+    chdir: null
+    override_dirname: expert_data_num=200,head_camera_type=D435,setting=demo_clean-rlas-group,task.dataset.sampling_plan_path=null,task.dataset.zarr_path=data/open_laptop-demo_clean-200.zarr,task.name=open_laptop,training.debug=False,training.device=cuda:0,training.resume=False,training.rlas.ema_beta=0.5,training.rlas.enabled=True,training.rlas.epsilon_mix=0.2,training.rlas.group_size=8,training.rlas.scoring_seed=12345,training.rlas.temperature=0.05,training.rlas.top_frac=0.3,training.rlas.update_interval=10000,training.rlas.warmup_updates=10000,training.save_every_updates=10000,training.save_init_checkpoint=True,training.seed=0,training.target_updates=60000
+    id: ???
+    num: ???
+    config_name: robot_dp_14.yaml
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.2.0
+    version_base: '1.2'
+    cwd: /root/code/RoboTwin-task2/policy/DP_RLAS_2
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /root/code/RoboTwin-task2/policy/DP_RLAS_2/diffusion_policy/config
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: /root/code/RoboTwin-task2/policy/DP_RLAS_2/logs/open_laptop/demo_clean-rlas-group-u60000-200-seed0/hydra_20260429_102424
+    choices:
+      task: default_task_14
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false

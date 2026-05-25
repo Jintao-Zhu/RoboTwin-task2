@@ -27,6 +27,7 @@ import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
+from openpi.training.rlas import DynamicWeightedRandomSampler, RLASState
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -222,6 +223,79 @@ def train_step(
     return new_state, info
 
 
+def score_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Array:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+
+    observation, actions = batch
+    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+
+    # pi0_base: shape usually [B, action_horizon]
+    # pi0_fast or other variants may return [B]
+    if chunked_loss.ndim > 1:
+        per_sample = jnp.mean(chunked_loss, axis=tuple(range(1, chunked_loss.ndim)))
+    else:
+        per_sample = chunked_loss
+
+    return per_sample
+
+
+def _make_scoring_batch(dataset, idx: np.ndarray, local_batch_size: int, data_sharding):
+    items = [dataset[int(i)] for i in idx.tolist()]
+    raw = _data_loader._collate_fn(items)
+    batch = (_model.Observation.from_dict(raw), raw["actions"])
+    batch = jax.tree.map(
+        lambda x: jax.make_array_from_process_local_data(data_sharding, x),
+        batch,
+    )
+    return batch
+
+
+def score_all_anchors(
+    *,
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    dataset,
+    score_fn,
+    data_sharding,
+    scoring_seed: int,
+    batch_size: int,
+) -> np.ndarray:
+    n = len(dataset)
+    losses = np.empty((n, ), dtype=np.float32)
+
+    base_rng = jax.random.PRNGKey(int(scoring_seed))
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        real_count = end - start
+
+        idx = np.arange(start, end, dtype=np.int64)
+        if real_count < batch_size:
+            pad = np.full((batch_size - real_count, ), end - 1, dtype=np.int64)
+            idx_padded = np.concatenate([idx, pad], axis=0)
+        else:
+            idx_padded = idx
+
+        batch = _make_scoring_batch(dataset, idx_padded, batch_size, data_sharding)
+
+        # 固定 scoring rng：同一个 start 每次 scoring 用同一随机条件
+        # 作用：让 current_loss - baseline_loss 更稳定，而不是被随机噪声主导。
+        rng = jax.random.fold_in(base_rng, int(start))
+
+        per_sample = score_fn(rng, state, batch)
+        per_sample_np = np.asarray(jax.device_get(per_sample), dtype=np.float32)
+
+        losses[start:end] = per_sample_np[:real_count]
+
+    return losses
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -292,7 +366,12 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
 
+    rlas_enabled = bool(config.rlas.enabled)
+    if rlas_enabled and not config.sampling_plan_path:
+        raise ValueError("RLAS requires --sampling-plan-path.")
+
     sampling_plan_info: dict[str, Any] = {}
+    run_summary_info: dict[str, Any] = {}
     if config.sampling_plan_path:
         from openpi.training.sampling_plan import SamplingPlan
 
@@ -340,7 +419,7 @@ def main(config: _config.TrainConfig):
         # expected_coverage：expected_unique / N
         # avg_repeat：平均每个被看到的样本重复次数（n / expected_unique）
         n = int(config.num_train_steps) * int(config.batch_size)
-        w = plan.weights.astype("float64")
+        w = np.ones_like(plan.weights, dtype="float64") if rlas_enabled else plan.weights.astype("float64")
         p = w / w.sum()
         ess = float(1.0 / (p * p).sum())
         if sampling_plan_info["plan_replacement"]:
@@ -394,27 +473,26 @@ def main(config: _config.TrainConfig):
                 float(config.plan_lr_scale_power),
                 scale,
             )
-        (config.checkpoint_dir / "run_summary.json").write_text(
-            json.dumps(
-                {
-                    "train_config_name": config.name,
-                    "exp_name": config.exp_name,
-                    "seed": config.seed,
-                    "num_train_steps": int(config.num_train_steps),
-                    "batch_size": int(config.batch_size),
-                    "freeze_mode": config.freeze_mode,
-                    "budget_aware_schedule": bool(config.budget_aware_schedule),
-                    "plan_aware_lr_scale": bool(config.plan_aware_lr_scale),
-                    "plan_target_effective_repeat": float(config.plan_target_effective_repeat),
-                    "norm_stats_asset_id": getattr(getattr(config.data, "assets", None), "asset_id", None),
-                    **sampling_plan_info,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        run_summary_info = {
+            "train_config_name": config.name,
+            "exp_name": config.exp_name,
+            "seed": config.seed,
+            "num_train_steps": int(config.num_train_steps),
+            "batch_size": int(config.batch_size),
+            "freeze_mode": config.freeze_mode,
+            "budget_aware_schedule": bool(config.budget_aware_schedule),
+            "plan_aware_lr_scale": bool(config.plan_aware_lr_scale),
+            "plan_target_effective_repeat": float(config.plan_target_effective_repeat),
+            "norm_stats_asset_id": getattr(getattr(config.data, "assets", None), "asset_id", None),
+            "rlas_enabled": bool(config.rlas.enabled),
+            "rlas_warmup_steps": int(config.rlas.warmup_steps),
+            "rlas_update_interval": int(config.rlas.update_interval),
+            "rlas_temperature": float(config.rlas.temperature),
+            "rlas_epsilon_mix": float(config.rlas.epsilon_mix),
+            "rlas_ema_beta": float(config.rlas.ema_beta),
+            "rlas_alpha": float(config.rlas.alpha),
+            **sampling_plan_info,
+        }
 
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
@@ -436,11 +514,63 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    rlas_state = None
+    rlas_snapshot_dir = None
+
+    if rlas_enabled:
+        if not isinstance(data_loader.sampler, DynamicWeightedRandomSampler):
+            raise TypeError(f"RLAS expects DynamicWeightedRandomSampler, got {type(data_loader.sampler)}")
+
+        num_anchors = len(data_loader.dataset)
+
+        rlas_state = RLASState(
+            num_anchors=num_anchors,
+            temperature=float(config.rlas.temperature),
+            epsilon_mix=float(config.rlas.epsilon_mix),
+            ema_beta=float(config.rlas.ema_beta),
+            alpha=float(config.rlas.alpha),
+        )
+
+        rlas_snapshot_dir = config.checkpoint_dir / str(config.rlas.snapshot_dirname)
+        rlas_snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        logging.info(
+            "RLAS enabled: anchors=%d warmup=%d interval=%d temperature=%g epsilon=%g ema_beta=%g alpha=%g",
+            num_anchors,
+            int(config.rlas.warmup_steps),
+            int(config.rlas.update_interval),
+            float(config.rlas.temperature),
+            float(config.rlas.epsilon_mix),
+            float(config.rlas.ema_beta),
+            float(config.rlas.alpha),
+        )
+
+        run_summary_info.update({
+            "rlas_num_anchors": int(num_anchors),
+            "rlas_snapshot_dir": str(rlas_snapshot_dir),
+        })
+
+    if run_summary_info:
+        (config.checkpoint_dir / "run_summary.json").write_text(
+            json.dumps(
+                run_summary_info,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1, ),
+    )
+    pscore_step = jax.jit(
+        functools.partial(score_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=data_sharding,
     )
 
     start_step = int(train_state.step)
@@ -456,24 +586,69 @@ def main(config: _config.TrainConfig):
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+            current_step = int(jax.device_get(train_state.step))
+            if rlas_enabled:
+                warmup = int(config.rlas.warmup_steps)
+                interval = int(config.rlas.update_interval)
+
+                should_rlas_update = False
+                if current_step == warmup:
+                    should_rlas_update = True
+                elif current_step > warmup and ((current_step - warmup) % interval == 0):
+                    should_rlas_update = True
+
+                if should_rlas_update:
+                    pbar.write(f"[RLAS] scoring all anchors at step {current_step} ...")
+
+                    scoring_batch_size = (
+                        int(config.rlas.scoring_batch_size)
+                        if config.rlas.scoring_batch_size is not None else int(config.batch_size)
+                    )
+
+                    current_losses = score_all_anchors(
+                        config=config,
+                        state=train_state,
+                        dataset=data_loader.dataset,
+                        score_fn=pscore_step,
+                        data_sharding=data_sharding,
+                        scoring_seed=int(config.rlas.scoring_seed),
+                        batch_size=scoring_batch_size,
+                    )
+
+                    if not rlas_state.initialized:
+                        new_weights = rlas_state.initialize(current_losses, step=current_step)
+                        pbar.write(f"[RLAS] initialized baseline losses at step {current_step}")
+                    else:
+                        new_weights = rlas_state.update(current_losses, step=current_step)
+                        pbar.write(f"[RLAS] updated weights at step {current_step}")
+
+                    data_loader.sampler.update_weights(new_weights)
+                    rlas_state.save_snapshot(
+                        rlas_snapshot_dir,
+                        step=current_step,
+                        current_losses=current_losses,
+                    )
+
+                    pbar.write(f"[RLAS] stats: {rlas_state.stats()}")
         infos.append(info)
-        if step % config.log_interval == 0:
+        if current_step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            pbar.write(f"Step {current_step}: {info_str}")
             if sampling_plan_info:
                 reduced_info = dict(reduced_info)
                 reduced_info.update({k: v for k, v in sampling_plan_info.items() if k.startswith("exposure_")})
-            wandb.log(reduced_info, step=step)
+            if rlas_enabled and rlas_state is not None:
+                reduced_info = dict(reduced_info)
+                reduced_info.update(rlas_state.stats())
+            wandb.log(reduced_info, step=current_step)
             infos = []
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            if step == config.num_train_steps - 1:
-                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step + 1)
-            else:
-                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        if (current_step % config.save_interval == 0
+                and current_step > start_step) or current_step == config.num_train_steps:
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, current_step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
